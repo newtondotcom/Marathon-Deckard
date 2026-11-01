@@ -140,7 +140,7 @@ fn emit(conn: &Connection, signal: &str, body: &(impl Serialize + DynamicType)) 
         async_io::block_on(conn.emit_signal(None::<&str>, OBJECT_PATH, INTERFACE, signal, body));
 }
 
-fn initialize(progress: &Progress<'_>, cancelled: &AtomicBool) -> Result<()> {
+pub(crate) fn initialize(progress: &Progress<'_>, cancelled: &AtomicBool) -> Result<()> {
     let instance = Instance::production();
     drivers::ensure_binder_nodes()?;
     let host = Host::probe()?;

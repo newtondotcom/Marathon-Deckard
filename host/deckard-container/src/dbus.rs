@@ -270,6 +270,11 @@ impl Backend {
     }
 
     fn start(&mut self, fields: &HashMap<String, String>, uid: u32) -> Result<()> {
+        // A new device has the installed images but no instance yet.
+        if !self.initialized() {
+            let progress = |message: &str| eprintln!("deckard-containerd: {message}");
+            initializer_dbus::initialize(&progress, &AtomicBool::new(false))?;
+        }
         let stopped = self.manager.lxc.status()? == State::Stopped;
         // A daemon stopped mid-teardown leaves the mounts and network up;
         // with Android stopped they are this runtime's to undo.
