@@ -1,0 +1,34 @@
+From 846519f5d212648f0f5deade92314859761eeab5 Mon Sep 17 00:00:00 2001
+From: patrickjquinn <patrick.jm.quinn@gmail.com>
+Date: Sun, 1 Nov 2026 08:21:52 +0000
+Subject: [PATCH] netd: Run without XFRM
+
+A kernel without CONFIG_XFRM_USER fails XfrmController::Init, and netd
+exited with status 3: Android restarted netd until it gave up and never
+finished booting, as on the Zinwa Q25. Log the failure and carry on;
+only IPsec (IKEv2 VPNs) is lost.
+
+Change-Id: If3c7d32793d592815915048526a482481f43919a
+---
+ server/Controllers.cpp | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/server/Controllers.cpp b/server/Controllers.cpp
+index 451175f..28ca1cc 100644
+--- a/server/Controllers.cpp
++++ b/server/Controllers.cpp
+@@ -337,9 +337,9 @@ void Controllers::init() {
+ 
+     netdutils::Status xStatus = XfrmController::Init();
+     if (!isOk(xStatus)) {
++        // Deckard: a kernel without XFRM runs Android without IPsec.
+         gLog.error("Failed to initialize XfrmController (%s)", netdutils::toString(xStatus).c_str());
+-        exit(3);
+-    };
++    }
+     gLog.info("Initializing XfrmController: %" PRId64 "us", s.getTimeAndResetUs());
+ }
+ 
+-- 
+2.55.0
+
