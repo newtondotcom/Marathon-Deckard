@@ -97,6 +97,19 @@ pub fn app(value: &Map<String, Value>) -> VariantMap {
         ("versionName", version.into()),
         ("versionCode", number(value, "versionCode", 1 << 53).into()),
         ("system", json::boolean(value, "system").into()),
+        (
+            "updatedSystem",
+            json::boolean(value, "updatedSystem").into(),
+        ),
+        (
+            "enabled",
+            value
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(true)
+                .into(),
+        ),
+        ("canDisable", json::boolean(value, "canDisable").into()),
         ("appBytes", number(value, "appBytes", 1 << 50).into()),
         ("dataBytes", number(value, "dataBytes", 1 << 50).into()),
         ("cacheBytes", number(value, "cacheBytes", 1 << 50).into()),

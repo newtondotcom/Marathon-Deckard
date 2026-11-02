@@ -288,6 +288,44 @@ fn list_is_capped_and_disconnected_bridge_fails_fast() -> TestResult<()> {
 }
 
 #[test]
+fn system_apps_list_their_state_and_uninstall_only_updates() -> TestResult<()> {
+    let (_bus, client, service, commands, _) = fixture(true, true)?;
+    let caller = client.clone();
+    let task = thread::spawn(move || -> TestResult<Vec<VariantMap>> {
+        Ok(zbus::block_on(proxy(&caller)?.call("ListPackages", &()))?)
+    });
+    let (_, sent) = command(&commands, 0);
+    let packages = json!([
+        {"pkg":"org.fdroid.fdroid", "label":"F-Droid", "system":true, "updatedSystem":true,
+         "enabled":false, "launchable":true},
+        {"pkg":"org.example.app", "label":"Example"}
+    ]);
+    service.handle(
+        BridgeRoute::User,
+        "packages_result",
+        json!({"id":sent["id"], "packages":packages})
+            .as_object()
+            .unwrap(),
+    )?;
+    let list = task.join().unwrap()?;
+    assert!(map_bool(&list[0], "system") && map_bool(&list[0], "updatedSystem"));
+    assert!(!map_bool(&list[0], "enabled"));
+    assert!(!map_bool(&list[1], "system") && !map_bool(&list[1], "updatedSystem"));
+    assert!(map_bool(&list[1], "enabled"));
+
+    let job: String =
+        zbus::block_on(proxy(&client)?.call("UninstallUpdates", &("org.fdroid.fdroid",)))?;
+    let (route, sent) = command(&commands, 1);
+    assert_eq!(route, BridgeRoute::System);
+    assert_eq!(sent["id"], job);
+    assert_eq!(sent["t"], "uninstall");
+    assert_eq!(sent["updates"], true);
+    let bad = zbus::block_on(proxy(&client)?.call::<_, _, String>("UninstallUpdates", &("../x",)));
+    assert!(bad.is_err());
+    Ok(())
+}
+
+#[test]
 fn pending_cap_rejects_new_jobs_without_leaking_staged_files() -> TestResult<()> {
     let (_bus, client, service, _commands, directory) = fixture(true, true)?;
     let apk = directory.path().join("sample.apk");

@@ -22,9 +22,8 @@
             android:name=".Forward"
             android:exported="true"
             android:excludeFromRecents="true"
-            android:noHistory="true"
             android:taskAffinity=""
-            android:theme="@android:style/Theme.NoDisplay">
+            android:theme="@android:style/Theme.Translucent.NoTitleBar">
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
@@ -80,10 +79,12 @@
                 <action android:name="android.settings.ZEN_MODE_SETTINGS" />
                 <action android:name="android.settings.MANAGE_APPLICATIONS_SETTINGS" />
                 <action android:name="android.settings.MANAGE_ALL_APPLICATIONS_SETTINGS" />
+                <action android:name="android.settings.MANAGE_DOMAIN_URLS" />
                 <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
             <intent-filter android:priority="2">
                 <action android:name="android.settings.APPLICATION_DETAILS_SETTINGS" />
+                <action android:name="android.settings.APP_OPEN_BY_DEFAULT_SETTINGS" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <data android:scheme="package" />
             </intent-filter>

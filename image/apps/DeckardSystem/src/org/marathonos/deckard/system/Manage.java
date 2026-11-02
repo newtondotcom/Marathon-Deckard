@@ -46,8 +46,8 @@ import java.util.concurrent.Executors;
  * Marathon Settings' requests for Android apps (protocol/bridge.md,
  * management): details, runtime permissions, notifications, links, battery,
  * force stop, clearing and special access. Runs as the system uid, so
- * Android's own permission checks admit every call; only apps the person
- * installed are changed.
+ * Android's own permission checks admit every call; only the apps Android's
+ * Settings lists as the person's are changed.
  */
 final class Manage {
     private static final String TAG = "DeckardManage";
@@ -115,18 +115,19 @@ final class Manage {
         switch (op) {
             case "info":
                 return new JSONObject().put("release", Build.VERSION.RELEASE).put("sdk", Build.VERSION.SDK_INT);
-            case "app": return app(c, userApp(c, pkg));
-            case "perm": permission(c, userApp(c, pkg), names(m.optJSONArray("permissions")), m.optBoolean("granted")); return null;
+            case "app": return app(c, managedApp(c, pkg));
+            case "perm": permission(c, managedApp(c, pkg), names(m.optJSONArray("permissions")), m.optBoolean("granted")); return null;
             case "perm_apps": return new JSONObject().put("apps", permissionApps(c, names(m.optJSONArray("permissions"))));
             case "notif_apps": return new JSONObject().put("apps", notificationApps(c));
-            case "notifications": notifications(c, userApp(c, pkg), m.optBoolean("enabled")); return null;
-            case "links": links(c, userApp(c, pkg), m.optBoolean("enabled")); return null;
-            case "battery": battery(userApp(c, pkg).packageName, "unrestricted".equals(m.optString("mode"))); return null;
-            case "stop": forceStop(c, userApp(c, pkg).packageName); return null;
-            case "cache": clearCache(c, userApp(c, pkg).packageName); return null;
-            case "clear": clearData(c, userApp(c, pkg).packageName); return null;
+            case "notifications": notifications(c, managedApp(c, pkg), m.optBoolean("enabled")); return null;
+            case "links": links(c, managedApp(c, pkg), m.optBoolean("enabled")); return null;
+            case "battery": battery(managedApp(c, pkg).packageName, "unrestricted".equals(m.optString("mode"))); return null;
+            case "stop": forceStop(c, managedApp(c, pkg).packageName); return null;
+            case "enable": enable(c, managedApp(c, pkg), m.optBoolean("enabled")); return null;
+            case "cache": clearCache(c, managedApp(c, pkg).packageName); return null;
+            case "clear": clearData(c, managedApp(c, pkg).packageName); return null;
             case "special": return new JSONObject().put("apps", special(c, m.optString("kind")));
-            case "special_set": setSpecial(c, m.optString("kind"), userApp(c, pkg), m.optBoolean("granted")); return null;
+            case "special_set": setSpecial(c, m.optString("kind"), managedApp(c, pkg), m.optBoolean("granted")); return null;
             case "gms": return GoogleServices.info(c);
             case "gms_set": GoogleServices.set(c, m.optString("key"), m.optBoolean("enabled")); return null;
             case "gms_open": GoogleServices.open(c, m.optString("page")); return null;
@@ -134,23 +135,69 @@ final class Manage {
         }
     }
 
-    /** Only apps the person installed are managed, never Android's own. */
-    private static ApplicationInfo userApp(Context c, String pkg) throws Exception {
+    /**
+     * The apps Android's own Settings lists as the person's
+     * (ApplicationsState.FILTER_DOWNLOADED_AND_LAUNCHER): installed ones,
+     * updated system apps and system apps with a launcher entry, such as
+     * F-Droid and Aurora shipped in the image. Deckard's own are left out,
+     * and so are those whose launcher Deckard disabled (Android's Settings).
+     */
+    private static boolean managed(ApplicationInfo ai, Set<String> launchable) {
+        if (ai.packageName.startsWith("org.marathonos.deckard."))
+            return false;
+        return (ai.flags & ApplicationInfo.FLAG_SYSTEM) == 0
+                || (ai.flags & ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) != 0
+                || launchable.contains(ai.packageName);
+    }
+
+    /**
+     * Packages with a launcher activity. One the person disabled with its app
+     * still counts, so the app can be enabled again; one turned off on its
+     * own, as Deckard does Android's Settings, doesn't.
+     */
+    private static Set<String> launchable(Context c) {
+        PackageManager pm = c.getPackageManager();
+        Set<String> out = new HashSet<>();
+        Intent launcher = new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER);
+        for (ResolveInfo ri : pm.queryIntentActivities(launcher,
+                PackageManager.ResolveInfoFlags.of(PackageManager.MATCH_DISABLED_COMPONENTS))) {
+            ActivityInfo a = ri.activityInfo;
+            int state = pm.getComponentEnabledSetting(new ComponentName(a.packageName, a.name));
+            boolean off = state == PackageManager.COMPONENT_ENABLED_STATE_DISABLED
+                    || state == PackageManager.COMPONENT_ENABLED_STATE_DISABLED_USER
+                    || state == PackageManager.COMPONENT_ENABLED_STATE_DEFAULT && !a.enabled;
+            if (!off)
+                out.add(a.packageName);
+        }
+        return out;
+    }
+
+    /** A system app Android's Settings lets the person disable: not signed as the platform. */
+    private static boolean canDisable(PackageManager pm, ApplicationInfo ai) {
+        return (ai.flags & ApplicationInfo.FLAG_SYSTEM) != 0
+                && !ai.packageName.startsWith("org.marathonos.deckard.")
+                && pm.checkSignatures("android", ai.packageName) != PackageManager.SIGNATURE_MATCH;
+    }
+
+    private static ApplicationInfo managedApp(Context c, String pkg) throws Exception {
         ApplicationInfo ai;
         try {
-            ai = c.getPackageManager().getApplicationInfo(pkg, PackageManager.ApplicationInfoFlags.of(0));
+            ai = c.getPackageManager().getApplicationInfo(pkg,
+                    PackageManager.ApplicationInfoFlags.of(PackageManager.MATCH_DISABLED_COMPONENTS));
         } catch (PackageManager.NameNotFoundException e) {
             throw new IllegalArgumentException("not installed");
         }
-        if ((ai.flags & ApplicationInfo.FLAG_SYSTEM) != 0)
+        if (!managed(ai, launchable(c)))
             throw new IllegalArgumentException("part of the system");
         return ai;
     }
 
-    private static List<ApplicationInfo> userApps(Context c) {
+    private static List<ApplicationInfo> managedApps(Context c) {
+        Set<String> launchable = launchable(c);
         List<ApplicationInfo> out = new ArrayList<>();
-        for (ApplicationInfo ai : c.getPackageManager().getInstalledApplications(PackageManager.ApplicationInfoFlags.of(0))) {
-            if ((ai.flags & ApplicationInfo.FLAG_SYSTEM) == 0)
+        for (ApplicationInfo ai : c.getPackageManager().getInstalledApplications(
+                PackageManager.ApplicationInfoFlags.of(PackageManager.MATCH_DISABLED_COMPONENTS))) {
+            if (managed(ai, launchable))
                 out.add(ai);
         }
         return out;
@@ -175,12 +222,15 @@ final class Manage {
     private static JSONObject app(Context c, ApplicationInfo ai) throws Exception {
         PackageManager pm = c.getPackageManager();
         String pkg = ai.packageName;
-        PackageInfo pi = pm.getPackageInfo(pkg, PackageManager.PackageInfoFlags.of(PackageManager.GET_PERMISSIONS));
+        PackageInfo pi = pm.getPackageInfo(pkg, PackageManager.PackageInfoFlags.of(PackageManager.GET_PERMISSIONS | PackageManager.MATCH_DISABLED_COMPONENTS));
         JSONObject r = new JSONObject().put("pkg", pkg)
                 .put("label", pm.getApplicationLabel(ai).toString())
                 .put("versionName", pi.versionName == null ? "" : pi.versionName)
                 .put("versionCode", pi.getLongVersionCode())
-                .put("system", false);
+                .put("system", (ai.flags & ApplicationInfo.FLAG_SYSTEM) != 0)
+                .put("updatedSystem", (ai.flags & ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) != 0)
+                .put("enabled", ai.enabled)
+                .put("canDisable", canDisable(pm, ai));
         try {
             StorageStats st = c.getSystemService(StorageStatsManager.class)
                     .queryStatsForPackage(StorageManager.UUID_DEFAULT, pkg, Process.myUserHandle());
@@ -198,7 +248,12 @@ final class Manage {
             for (String host : links.getHostToStateMap().keySet())
                 domains.put(host);
         }
-        r.put("links", links != null && links.isLinkHandlingAllowed()).put("domains", domains);
+        boolean open = links != null && links.isLinkHandlingAllowed();
+        if (open) {
+            for (int state : links.getHostToStateMap().values())
+                open &= state != DomainVerificationUserState.DOMAIN_STATE_NONE;
+        }
+        r.put("links", open).put("domains", domains);
         r.put("battery", c.getSystemService(PowerManager.class).isIgnoringBatteryOptimizations(pkg)
                 ? "unrestricted" : "optimized");
 
@@ -230,8 +285,8 @@ final class Manage {
     private static JSONArray permissionApps(Context c, String[] perms) throws Exception {
         PackageManager pm = c.getPackageManager();
         JSONArray out = new JSONArray();
-        for (ApplicationInfo ai : userApps(c)) {
-            PackageInfo pi = pm.getPackageInfo(ai.packageName, PackageManager.PackageInfoFlags.of(PackageManager.GET_PERMISSIONS));
+        for (ApplicationInfo ai : managedApps(c)) {
+            PackageInfo pi = pm.getPackageInfo(ai.packageName, PackageManager.PackageInfoFlags.of(PackageManager.GET_PERMISSIONS | PackageManager.MATCH_DISABLED_COMPONENTS));
             List<String> asked = requested(c, pi, perms);
             if (asked.isEmpty())
                 continue;
@@ -250,7 +305,7 @@ final class Manage {
         PackageManager pm = c.getPackageManager();
         Object nm = notificationService();
         JSONArray out = new JSONArray();
-        for (ApplicationInfo ai : userApps(c)) {
+        for (ApplicationInfo ai : managedApps(c)) {
             boolean on = (Boolean) nm.getClass().getMethod("areNotificationsEnabledForPackage", String.class, int.class)
                     .invoke(nm, ai.packageName, ai.uid);
             out.put(new JSONObject().put("pkg", ai.packageName).put("label", pm.getApplicationLabel(ai).toString())
@@ -290,7 +345,7 @@ final class Manage {
         if (perms.length == 0)
             throw new IllegalArgumentException("unknown permission");
         PackageManager pm = c.getPackageManager();
-        PackageInfo pi = pm.getPackageInfo(ai.packageName, PackageManager.PackageInfoFlags.of(PackageManager.GET_PERMISSIONS));
+        PackageInfo pi = pm.getPackageInfo(ai.packageName, PackageManager.PackageInfoFlags.of(PackageManager.GET_PERMISSIONS | PackageManager.MATCH_DISABLED_COMPONENTS));
         UserHandle user = Process.myUserHandle();
         for (String p : requested(c, pi, perms)) {
             if ((flags(pm, p, ai.packageName) & (FLAG_PERMISSION_SYSTEM_FIXED | FLAG_PERMISSION_POLICY_FIXED)) != 0)
@@ -309,16 +364,43 @@ final class Manage {
                 .invoke(nm, ai.packageName, ai.uid, enabled);
     }
 
+    /**
+     * Links the app can't verify, such as Aurora's play.google.com, open in it
+     * only once selected, as Android's "Add links" does; on selects them too.
+     */
     private static void links(Context c, ApplicationInfo ai, boolean enabled) throws Exception {
         DomainVerificationManager dvm = c.getSystemService(DomainVerificationManager.class);
         DomainVerificationManager.class.getMethod("setDomainVerificationLinkHandlingAllowed", String.class, boolean.class)
                 .invoke(dvm, ai.packageName, enabled);
+        DomainVerificationUserState state = dvm.getDomainVerificationUserState(ai.packageName);
+        if (state == null)
+            return;
+        Set<String> unverified = new HashSet<>();
+        for (Map.Entry<String, Integer> e : state.getHostToStateMap().entrySet()) {
+            if (e.getValue() != DomainVerificationUserState.DOMAIN_STATE_VERIFIED)
+                unverified.add(e.getKey());
+        }
+        if (unverified.isEmpty())
+            return;
+        Object id = DomainVerificationUserState.class.getMethod("getIdentifier").invoke(state);
+        int result = (Integer) DomainVerificationManager.class.getMethod("setDomainVerificationUserSelection",
+                java.util.UUID.class, Set.class, boolean.class).invoke(dvm, id, unverified, enabled);
+        if (result != 0)
+            throw new IllegalStateException("another app opens these links");
     }
 
     private static void battery(String pkg, boolean unrestricted) throws Exception {
         Object idle = deviceIdle();
         idle.getClass().getMethod(unrestricted ? "addPowerSaveWhitelistApp" : "removePowerSaveWhitelistApp", String.class)
                 .invoke(idle, pkg);
+    }
+
+    private static void enable(Context c, ApplicationInfo ai, boolean enabled) {
+        PackageManager pm = c.getPackageManager();
+        if (!enabled && !canDisable(pm, ai))
+            throw new IllegalArgumentException("Android can't disable this app");
+        pm.setApplicationEnabledSetting(ai.packageName, enabled ? PackageManager.COMPONENT_ENABLED_STATE_DEFAULT
+                : PackageManager.COMPONENT_ENABLED_STATE_DISABLED_USER, 0);
     }
 
     private static void forceStop(Context c, String pkg) throws Exception {
@@ -358,31 +440,28 @@ final class Manage {
         PackageManager pm = c.getPackageManager();
         Map<ApplicationInfo, Boolean> out = new java.util.LinkedHashMap<>();
         Map<String, ApplicationInfo> apps = new HashMap<>();
-        for (ApplicationInfo ai : userApps(c))
+        for (ApplicationInfo ai : managedApps(c))
             apps.put(ai.packageName, ai);
         String[] op = APP_OPS.get(kind);
         if (op != null) {
             AppOpsManager ops = c.getSystemService(AppOpsManager.class);
-            for (ApplicationInfo ai : userApps(c)) {
+            for (ApplicationInfo ai : managedApps(c)) {
                 if (!canHave(pm, ai, op[0]))
                     continue;
-                int mode = ops.unsafeCheckOpNoThrow(op[1], ai.uid, ai.packageName);
-                boolean granted = mode == AppOpsManager.MODE_ALLOWED || (mode == AppOpsManager.MODE_DEFAULT
-                        && op[0] != null && pm.checkPermission(op[0], ai.packageName) == PackageManager.PERMISSION_GRANTED);
-                out.put(ai, granted);
+                out.put(ai, granted(pm, ops, op, ai));
             }
             return out;
         }
         switch (kind) {
             case "battery": {
                 PowerManager power = c.getSystemService(PowerManager.class);
-                for (ApplicationInfo ai : userApps(c))
+                for (ApplicationInfo ai : managedApps(c))
                     out.put(ai, power.isIgnoringBatteryOptimizations(ai.packageName));
                 return out;
             }
             case "dnd": {
                 Object nm = notificationService();
-                for (ApplicationInfo ai : userApps(c)) {
+                for (ApplicationInfo ai : managedApps(c)) {
                     if (canHave(pm, ai, "android.permission.ACCESS_NOTIFICATION_POLICY"))
                         out.put(ai, (Boolean) nm.getClass().getMethod("isNotificationPolicyAccessGrantedForPackage", String.class)
                                 .invoke(nm, ai.packageName));
@@ -424,9 +503,25 @@ final class Manage {
         }
     }
 
+    private static boolean granted(PackageManager pm, AppOpsManager ops, String[] op, ApplicationInfo ai) {
+        int mode = ops.unsafeCheckOpNoThrow(op[1], ai.uid, ai.packageName);
+        return mode == AppOpsManager.MODE_ALLOWED || (mode == AppOpsManager.MODE_DEFAULT
+                && op[0] != null && pm.checkPermission(op[0], ai.packageName) == PackageManager.PERMISSION_GRANTED);
+    }
+
+    /** Whether pkg has the special access an app op grants, such as install_apps. */
+    static boolean hasAccess(Context c, String kind, String pkg) throws Exception {
+        String[] op = APP_OPS.get(kind);
+        if (op == null)
+            throw new IllegalArgumentException("unknown access");
+        PackageManager pm = c.getPackageManager();
+        ApplicationInfo ai = pm.getApplicationInfo(pkg, PackageManager.ApplicationInfoFlags.of(0));
+        return granted(pm, c.getSystemService(AppOpsManager.class), op, ai);
+    }
+
     private static boolean canHave(PackageManager pm, ApplicationInfo ai, String permission) throws Exception {
         if (permission == null) {
-            PackageInfo pi = pm.getPackageInfo(ai.packageName, PackageManager.PackageInfoFlags.of(PackageManager.GET_ACTIVITIES));
+            PackageInfo pi = pm.getPackageInfo(ai.packageName, PackageManager.PackageInfoFlags.of(PackageManager.GET_ACTIVITIES | PackageManager.MATCH_DISABLED_COMPONENTS));
             if (pi.activities != null) {
                 for (ActivityInfo a : pi.activities) {
                     if ((a.flags & FLAG_SUPPORTS_PICTURE_IN_PICTURE) != 0)
@@ -435,7 +530,7 @@ final class Manage {
             }
             return false;
         }
-        PackageInfo pi = pm.getPackageInfo(ai.packageName, PackageManager.PackageInfoFlags.of(PackageManager.GET_PERMISSIONS));
+        PackageInfo pi = pm.getPackageInfo(ai.packageName, PackageManager.PackageInfoFlags.of(PackageManager.GET_PERMISSIONS | PackageManager.MATCH_DISABLED_COMPONENTS));
         return pi.requestedPermissions != null && Arrays.asList(pi.requestedPermissions).contains(permission);
     }
 
@@ -443,7 +538,7 @@ final class Manage {
     private static Map<String, List<ComponentName>> components(Context c, String kind) {
         PackageManager pm = c.getPackageManager();
         Map<String, ApplicationInfo> apps = new HashMap<>();
-        for (ApplicationInfo ai : userApps(c))
+        for (ApplicationInfo ai : managedApps(c))
             apps.put(ai.packageName, ai);
         List<ResolveInfo> found = new ArrayList<>();
         String bind;

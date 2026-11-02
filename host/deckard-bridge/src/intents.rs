@@ -96,6 +96,8 @@ const PAGES: &[(&str, &str)] = &[
     ("android.settings.APPLICATION_DETAILS_SETTINGS", "appmanager"),
     ("android.settings.MANAGE_APPLICATIONS_SETTINGS", "appmanager"),
     ("android.settings.MANAGE_ALL_APPLICATIONS_SETTINGS", "appmanager"),
+    ("android.settings.APP_OPEN_BY_DEFAULT_SETTINGS", "appmanager"),
+    ("android.settings.MANAGE_DOMAIN_URLS", "appmanager"),
 ];
 
 /// Special access: Marathon Settings' page for the kind.

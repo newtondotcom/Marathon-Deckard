@@ -15,9 +15,11 @@ import org.json.JSONException;
 import org.json.JSONObject;
 
 /**
- * Removes an app the person installed (protocol/bridge.md, Packages). Android
- * only uninstalls silently for the app's installer of record or the system
- * uid, so DeckardBridge cannot remove apps it did not install; this does.
+ * Removes an app the person installed, or the updates installed over a
+ * system app, which returns it to the image's copy (protocol/bridge.md,
+ * Packages). Android only uninstalls silently for the app's installer of
+ * record or the system uid, so DeckardBridge cannot remove apps it did not
+ * install; this does.
  */
 final class Uninstall {
     private static final String TAG = "DeckardUninstall";
@@ -29,7 +31,8 @@ final class Uninstall {
     static synchronized void handle(JSONObject m) {
         String id = m.optString("id");
         String pkg = m.optString("pkg");
-        Log.i(TAG, "uninstall " + pkg + " (" + id + ")");
+        boolean updates = m.optBoolean("updates");
+        Log.i(TAG, "uninstall " + (updates ? "updates of " : "") + pkg + " (" + id + ")");
         try {
             Context c = (Context) Class.forName("android.app.ActivityThread").getMethod("currentApplication").invoke(null);
             if (!sRegistered) {
@@ -46,8 +49,17 @@ final class Uninstall {
                 }, new IntentFilter(ACTION), Context.RECEIVER_NOT_EXPORTED);
                 sRegistered = true;
             }
-            ApplicationInfo ai = c.getPackageManager().getApplicationInfo(pkg, PackageManager.ApplicationInfoFlags.of(0));
-            if ((ai.flags & ApplicationInfo.FLAG_SYSTEM) != 0 || pkg.startsWith("org.marathonos.deckard.")) {
+            ApplicationInfo ai = c.getPackageManager().getApplicationInfo(pkg,
+                    PackageManager.ApplicationInfoFlags.of(PackageManager.MATCH_DISABLED_COMPONENTS));
+            if (pkg.startsWith("org.marathonos.deckard.")) {
+                reply(id, false, pkg, "part of the system");
+                return;
+            }
+            if (updates && (ai.flags & ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) == 0) {
+                reply(id, false, pkg, "no updates to remove");
+                return;
+            }
+            if (!updates && (ai.flags & ApplicationInfo.FLAG_SYSTEM) != 0) {
                 reply(id, false, pkg, "part of the system");
                 return;
             }

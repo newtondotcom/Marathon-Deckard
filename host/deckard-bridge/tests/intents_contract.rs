@@ -80,6 +80,9 @@ fn opens_route_like_cxx() {
         ("android.settings.MANAGE_ALL_FILES_ACCESS_PERMISSION", "", "androidaccess/all_files"),
         ("android.settings.MANAGE_UNKNOWN_APP_SOURCES", "../../x", "androidaccess/install_apps"),
         ("android.settings.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS", "org.fdroid.fdroid", "androidaccess/battery/org.fdroid.fdroid"),
+        ("android.settings.MANAGE_UNKNOWN_APP_SOURCES", "com.aurora.store", "androidaccess/install_apps/com.aurora.store"),
+        ("android.settings.APP_OPEN_BY_DEFAULT_SETTINGS", "com.aurora.store", "appmanager/deckard.com.aurora.store"),
+        ("android.settings.MANAGE_DOMAIN_URLS", "", "appmanager"),
     ];
     for (action, pkg, page) in pages {
         assert_eq!(settings_route(action, pkg), page, "{action}");

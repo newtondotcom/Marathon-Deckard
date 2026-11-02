@@ -64,6 +64,17 @@ fn cxx_manage_request_and_reply_shapes() {
         "Android Settings"
     );
     assert!(contract::app(json!({"pkg":"../etc"}).as_object().unwrap()).is_empty());
+    let flag =
+        |app: &deckard_packages::VariantMap, key: &str| bool::try_from(app[key].clone()).unwrap();
+    assert!(!flag(&app, "system") && !flag(&app, "updatedSystem") && !flag(&app, "canDisable"));
+    assert!(flag(&app, "enabled"));
+    let stock = contract::app(
+        json!({"pkg":"org.fdroid.fdroid","system":true,"updatedSystem":true,"enabled":false,"canDisable":true})
+            .as_object()
+            .unwrap(),
+    );
+    assert!(flag(&stock, "system") && flag(&stock, "updatedSystem") && flag(&stock, "canDisable"));
+    assert!(!flag(&stock, "enabled"));
     let apps = contract::apps(
         json!({"apps":[
             {"pkg":"com.example","granted":true}, {"pkg":"com.example","granted":false},
@@ -129,6 +140,7 @@ fn cxx_dbus_method_and_signal_signatures() -> Result<(), Box<dyn std::error::Err
         ("SetOpenLinks", "sb", ""),
         ("SetBattery", "ss", ""),
         ("ForceStop", "s", ""),
+        ("SetAppEnabled", "sb", ""),
         ("ClearCache", "s", ""),
         ("ClearData", "s", ""),
         ("GetSpecialAccess", "s", "aa{sv}"),

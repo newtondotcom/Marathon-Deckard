@@ -442,6 +442,22 @@ impl PackagesInterface {
         service.start(Kind::Uninstall, BridgeRoute::System, message, None, None)
     }
 
+    /// Removes the updates installed over a system app, which returns it
+    /// to the image's copy.
+    async fn uninstall_updates(
+        &self,
+        package: &str,
+        #[zbus(header)] header: Header<'_>,
+    ) -> fdo::Result<String> {
+        let service = self.service()?;
+        service.allowed(&header).await?;
+        if !ids::is_package_name(package) {
+            return Err(fdo::Error::InvalidArgs("bad package name".to_owned()));
+        }
+        let message = json!({"t": "uninstall", "pkg": package, "updates": true});
+        service.start(Kind::Uninstall, BridgeRoute::System, message, None, None)
+    }
+
     async fn device_profile(&self) -> fdo::Result<VariantMap> {
         let service = self.service()?;
         let reply = service.query(Kind::Device, json!({"t": "device"}), None);
@@ -561,8 +577,14 @@ fn packages(message: &Map<String, Value>) -> Vec<VariantMap> {
             continue;
         }
         let launchable = entry.get("launchable").and_then(Value::as_bool);
+        let enabled = entry.get("enabled").and_then(Value::as_bool);
         let more = [
             ("system", json::boolean(entry, "system").into()),
+            (
+                "updatedSystem",
+                json::boolean(entry, "updatedSystem").into(),
+            ),
+            ("enabled", enabled.unwrap_or(true).into()),
             ("launchable", launchable.unwrap_or(true).into()),
         ];
         list.push(dict(identity(entry).into_iter().chain(more)));

@@ -12,18 +12,60 @@ import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 
-/** Hands a link, number, address, place or settings page to the Marathon app for it. */
+/**
+ * Hands a link, number, address, place or settings page to the Marathon app
+ * for it. An app waiting for a settings page's result gets it once Marathon
+ * shows the app again, as on returning from Android's Settings.
+ */
 public final class Forward extends Activity {
+    private boolean mWaiting;
+    private boolean mLeft;
+    private String mKind;
+    private String mPkg;
+    private boolean mBefore;
+
     @Override
     protected void onCreate(Bundle state) {
         super.onCreate(state);
         try {
             JSONObject m = describe(getIntent());
-            if (m != null)
+            if (m != null) {
                 HostLink.get().send(m.put("t", "open"));
-        } catch (JSONException | RuntimeException e) {
+                mWaiting = state == null && getCallingActivity() != null && HostLink.get().isConnected()
+                        && "settings".equals(m.optString("kind"));
+            }
+            if (mWaiting) {
+                mPkg = m.optString("pkg", null);
+                mKind = mPkg == null ? null : SettingsResult.reported(m.optString("action"));
+                mBefore = mKind != null && Manage.hasAccess(this, mKind, mPkg);
+            }
+        } catch (Exception e) {
             Log.w(HostLink.TAG, "not forwarded", e);
+            mWaiting = false;
         }
+        if (!mWaiting)
+            finish();
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        mLeft = mWaiting;
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (!mLeft)
+            return;
+        int code = RESULT_CANCELED;
+        try {
+            if (mKind != null)
+                code = SettingsResult.code(mBefore, Manage.hasAccess(this, mKind, mPkg));
+        } catch (Exception e) {
+            Log.w(HostLink.TAG, "settings result", e);
+        }
+        setResult(code);
         finish();
     }
 
