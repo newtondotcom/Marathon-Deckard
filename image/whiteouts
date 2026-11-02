@@ -137,6 +137,7 @@ system/system_ext/priv-app/Launcher3QuickStep
 system/system_ext/priv-app/Updater
 system/system_ext/app/LocalContactsBackup
 system/system_ext/priv-app/AvatarPicker
+system/priv-app/PrivateSpace
 system/priv-app/DeviceDiagnostics
 system/priv-app/DeviceAsWebcam
 system/product/overlay/ApertureFrameworksBaseOverlay.apk

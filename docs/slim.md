@@ -606,6 +606,10 @@ Deckard's own 23.2 image keeps the same overlay, with these differences
   control target is SystemUI's `DisplayImeController`; without it no
   keyboard is shown. It needs `org.lineageos.globalactions.xml`, which stays
   too.
+- PrivateSpace (`com.android.privatespace`, new in Android 16) is whited
+  out with ManagedProvisioning's reason: a private space is a second
+  profile, Deckard runs one user without `android.software.managed_users`,
+  and its launcher entry opened a black window on the Zinwa Q25.
 - LineageSetupWizard replaces Provision on this image and is hidden the same
   way; `deckard-slim.rc` marks the device provisioned and set up.
 - App tasks stay fullscreen (WindowFit fits them only below SDK 36): a
