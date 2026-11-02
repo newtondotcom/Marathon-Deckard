@@ -25,7 +25,7 @@ built by Deckard is in progress.
 | `deckard-bridge` | `deckard-bridge.service` (user) | Joins Android to the shell over three sockets: windows, notifications, media, permissions, packages, sharing, location, toasts and the keyboard. Serves `org.marathonos.Deckard` |
 | `deckard-launch` | `/usr/libexec/deckard-launch` | What an Android app's desktop entry runs: starts Android if needed, then opens the app |
 | `deckard-migrate` | `deckard-migrate.service` (root, at boot) | Moves a Waydroid install's data and names to Deckard's, journaled and reversible |
-| `image/` | inside Android | DeckardBridge, DeckardSystem, DeckardIme, the blank home, the patched PermissionController, microG and the system overlay |
+| `image/` | inside Android | DeckardBridge, DeckardSystem, DeckardIme, the blank home, microG and the system overlay |
 
 The wire protocol between the bridge and Android is in
 [protocol/bridge.md](protocol/bridge.md).
@@ -100,8 +100,7 @@ DECKARD_SRC=/path/to/Marathon-Deckard scripts/qemu/lib/build-deckard-apk.sh
 
 The Android apps under `image/apps` are built with `image/tools/build-apk.sh`
 (no Gradle) and committed, because the Alpine package build has no Android
-SDK. `deckard-image-tools` generates the theme palette, the fonts and the
-PermissionController patch.
+SDK. `deckard-image-tools` generates the theme palette and the fonts.
 
 ## Documentation
 
@@ -115,5 +114,4 @@ PermissionController patch.
 ## Licence
 
 GPL-3.0-or-later, except `image/deckard-image-tools` (GPL-3.0-only). See
-[LICENSE](LICENSE). The Android images, microG and the PermissionController
-APK keep their own licences.
+[LICENSE](LICENSE). The Android images and microG keep their own licences.

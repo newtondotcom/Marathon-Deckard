@@ -6,11 +6,11 @@ use std::process::ExitCode;
 
 use deckard_core::palette::{Color, Theme};
 use deckard_host_tools::files;
-use deckard_image_tools::{fonts, palette, permission_view};
+use deckard_image_tools::{fonts, palette};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-const USAGE: &str = "usage: deckard-image-tools palette|fonts|permission-view [--option value]";
+const USAGE: &str = "usage: deckard-image-tools palette|fonts [--option value]";
 
 fn write_output(path: &Path, content: &[u8]) -> Result<()> {
     let parent = path
@@ -47,12 +47,8 @@ fn run() -> Result<()> {
     let output = take("--out").ok_or("missing --out")?;
     let (input, highlight, mcolors) = match command.as_str() {
         "palette" => (None, take("--highlight"), take("--mcolors")),
-        "fonts" | "permission-view" => {
-            (Some(take("--input").ok_or("missing --input")?), None, None)
-        }
-        _ => {
-            return Err("unknown command; expected palette, fonts or permission-view".into());
-        }
+        "fonts" => (Some(take("--input").ok_or("missing --input")?), None, None),
+        _ => return Err("unknown command; expected palette or fonts".into()),
     };
     if !options.is_empty() {
         return Err(format!("unknown {command} option").into());
@@ -70,7 +66,7 @@ fn run() -> Result<()> {
             };
             write_output(&output, palette::render(highlight, theme).as_bytes())
         }
-        "fonts" => {
+        _ => {
             let read = |name: &str| fs::read_to_string(input.join(name));
             let xml = read("fonts-lineage-20.xml")?;
             let generated = fonts::generate(
@@ -89,10 +85,6 @@ fn run() -> Result<()> {
             }
             Ok(())
         }
-        _ => write_output(
-            &output,
-            permission_view::patch(&fs::read_to_string(input)?)?.as_bytes(),
-        ),
     }
 }
 

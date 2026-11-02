@@ -71,23 +71,6 @@ fn palette_command_validates_options_before_changing_files() {
 }
 
 #[test]
-fn failed_permission_patch_preserves_original_file() {
-    let temporary = tempfile::tempdir().unwrap();
-    let source = temporary.path().join("GrantPermissionsActivity.smali");
-    std::fs::write(&source, "unknown image\n").unwrap();
-    let result = command()
-        .arg("permission-view")
-        .arg("--input")
-        .arg(&source)
-        .arg("--out")
-        .arg(&source)
-        .output()
-        .unwrap();
-    assert!(!result.status.success());
-    assert_eq!(std::fs::read_to_string(source).unwrap(), "unknown image\n");
-}
-
-#[test]
 fn accepts_equals_options_for_existing_build_script_callers() {
     let temporary = tempfile::tempdir().unwrap();
     let output = temporary.path().join("colors.xml");

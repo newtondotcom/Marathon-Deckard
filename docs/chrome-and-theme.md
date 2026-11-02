@@ -338,13 +338,9 @@ visible: nativeAppWindow.ambienceBackdrop
   - Marathon's own prompt (`PermissionDialog.qml`) is a full-screen Silica
     dialog; this is the closest an overlay gets inside Android's dialog
     frame.
-- **Drawing the prompt in Marathon.** The image's PermissionController APEX
-  is flattened: `/system/apex/com.android.permission/` is a directory, with
-  `priv-app/PermissionController@TQ3A.230901.001/PermissionController.apk`.
-  A whiteout of that directory in Waydroid's overlay plus a replacement
-  PermissionController (or a GrantPermissionsActivity that forwards to
-  Marathon's `Permissions1` prompt) could later let Marathon draw the prompt
-  itself.
+- **Drawing the prompt in Marathon.** Marathon draws runtime permission
+  prompts itself ([permissions.md](permissions.md)); this restyled dialog is
+  what Android shows when Marathon can't ask.
 - The chooser/resolver belongs to the slim agent (`config_chooserActivity`
   → Marathon share sheet).
 - Not verified on screen: a DeviceDefault popup menu. By source it is opaque
