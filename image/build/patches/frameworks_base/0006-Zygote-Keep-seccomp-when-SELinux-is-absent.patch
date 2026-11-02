@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: patrickjquinn <patrick.jm.quinn@gmail.com>
+Date: Mon, 2 Nov 2026 15:25:22 +0000
+Subject: [PATCH] Zygote: Keep seccomp when SELinux is absent
+
+Zygote skips every seccomp filter, for apps, app zygotes, system_server
+and the setuid/setgid range, when security_getenforce() is 0, so that
+"setenforce 0" also lifts seccomp while debugging. Deckard's libselinux
+reports 0 there because SELinux is ignored, not permissive, so every
+Android process ran with no Android seccomp filter at all.
+
+Upstream libselinux returns -1 without selinuxfs, which keeps the
+filters on. Match that: only a running, permissive SELinux turns
+seccomp off.
+---
+ core/jni/com_android_internal_os_Zygote.cpp | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/core/jni/com_android_internal_os_Zygote.cpp b/core/jni/com_android_internal_os_Zygote.cpp
+index 27220c00e..b11d2d4a9 100644
+--- a/core/jni/com_android_internal_os_Zygote.cpp
++++ b/core/jni/com_android_internal_os_Zygote.cpp
+@@ -2870,8 +2870,9 @@ static void com_android_internal_os_Zygote_nativeInitNativeState(JNIEnv* env, jc
+    */
+ 
+   // security_getenforce is not allowed on app process. Initialize and cache
+-  // the value before zygote forks.
+-  gIsSecurityEnforced = security_getenforce();
++  // the value before zygote forks. Only a permissive SELinux turns seccomp
++  // off; without SELinux the filters stay on.
++  gIsSecurityEnforced = is_selinux_enabled() <= 0 || security_getenforce() != 0;
+ 
+   // Disabled for Deckard
+   /*selinux_android_seapp_context_init();*/
+-- 
+2.55.0
+
