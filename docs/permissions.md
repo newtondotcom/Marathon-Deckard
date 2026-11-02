@@ -77,7 +77,7 @@ patch is one constructor call in `GrantPermissionsActivity.onCreate` plus
 | Coarse only | `accuracy: approximate` | "…your approximate location" |
 | Fine only, coarse granted (upgrade) | `kind: precise` | "…wants your precise location" |
 | "All the time" (see below) | `kind: background` | "…wants to use your location all the time, even when you aren't using it" |
-| Photos and videos with Android 14's picker (apps targeting API 34+, or declaring `READ_MEDIA_VISUAL_USER_SELECTED`) | none | Android's dialog: Marathon's prompt has no "select photos" choice. Older apps get the plain question and Marathon's storage prompt. |
+| `ALLOW_SELECTED` offered: photos and videos with Android 14's picker (apps targeting API 34+, or declaring `READ_MEDIA_VISUAL_USER_SELECTED`) | `limited` | An "Only photos I pick" switch, off by default. Older apps get the plain question and no switch. |
 
 Marathon's design system allows two actions per dialog, so Android's extra
 buttons become switches: Deny and Allow stay the prompt's only actions.
@@ -87,8 +87,9 @@ The answer maps back to the button Android offered:
 | Answer | Result |
 |---|---|
 | Allow | `GRANTED_ALWAYS` if Android offered Allow, else `GRANTED_FOREGROUND_ONLY` ("while using the app"). The location permissions passed are the ones the precise switch chose, as the dialog's radio buttons would. |
+| Allow, only photos I pick | `GRANTED_USER_SELECTED`: GrantPermissionsActivity opens Android's photo picker, and the app gets the photos and videos chosen there (`READ_MEDIA_VISUAL_USER_SELECTED`) |
 | Allow, only this time | `GRANTED_ONE_TIME`: Android's one-time session; the grant goes when the app has been in the background for a while |
-| Deny | `DENIED_DO_NOT_ASK_AGAIN` when Android offered "don't allow" in its second-time form (the group was denied before, `USER_SET`), else `DENIED`. Android 11+ semantics: the second denial is final (`USER_FIXED`) and the app's `shouldShowRequestPermissionRationale` follows. |
+| Deny | `DENIED_DO_NOT_ASK_AGAIN` when Android offered "don't allow" in its second-time form (the group was denied before, `USER_SET`), else `DENIED`. Android 11+ semantics: the second denial is final (`USER_FIXED`) and the app's `shouldShowRequestPermissionRationale` follows. After a limited grant, Android asks whether to pick more; Deny is then `DENIED_MORE` and keeps the photos already chosen. |
 | Dismissed (back, Home, another app in front, the shell gone) | `CANCELED`, as Android's back: no flags change and the app may ask again |
 | deckard-bridge can't ask (no shell method, refused, unknown permission, too many waiting) | Android's own dialog is shown. DeckardPermissionControllerRes restyles Android 13's Material 3 layout; Android 16 draws its expressive layout, which the overlay doesn't reach yet. |
 
@@ -133,11 +134,11 @@ declaration (`deckard-bridge.service.json`) now lists it.
 
 - `PromptAndroid(s appId, s permission, a{sv} options) → a{sv}`: the reply
   is delayed until the person answers: `{answer: allow|once|deny|cancel,
-  precise: b}`.
-  - `appId` must be `waydroid.<package>`.
+  precise: b, limited: b}`.
+  - `appId` must be `deckard.<package>`.
   - `permission` must be a Marathon vocabulary name that isn't restricted.
-  - `options` hold `request` (16 hex digits), `kind`, `once`, `accuracy`
-    and `preciseDefault`.
+  - `options` hold `request` (16 hex digits), `kind`, `once`, `accuracy`,
+    `preciseDefault` and `limited`.
   - At most 16 prompts wait.
   - A caller that leaves the bus has its prompts cancelled.
 - `CancelAndroidPrompt(s request)`.
@@ -203,6 +204,12 @@ isn't a privacy switch. So there is nothing for the prompt to defer to yet.
     `READ_MEDIA_VISUAL_USER_SELECTED` with them.
   - The first screenshots after each request show the app, then Marathon's
     prompt; Android's dialog never appears.
-- **Still Android's dialog**: photos and videos for apps targeting API 34+
-  (Android 14's "Allow limited access" picker), and anything Marathon
-  can't name.
+  - Photos with Android 14's picker, test app targeting API 34: Marathon's
+    prompt with "Only photos I pick", off by default. Allow gives
+    `READ_MEDIA_IMAGES` and `READ_MEDIA_VIDEO` (`USER_SET`); Deny leaves
+    them denied (`USER_SET`, rationale shown). With the switch on, Allow
+    opens Android's photo picker; after one of three photos was picked,
+    `READ_MEDIA_VISUAL_USER_SELECTED` was granted (`USER_SET`) and the app's
+    MediaStore query returned only that photo. The picker needs Android's
+    emulated storage (`/dev/fuse` in the container).
+- **Still Android's dialog**: anything Marathon can't name.
