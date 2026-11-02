@@ -1,5 +1,6 @@
 package org.marathonos.deckard.system;
 
+import android.app.ActivityManager;
 import android.app.TaskStackListener;
 import android.content.ComponentName;
 import android.content.Context;
@@ -16,8 +17,10 @@ import android.util.Log;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Keeps every app task on Android's display as a freeform task that fills the
@@ -50,6 +53,7 @@ final class WindowFit {
     private static Method wctSetBounds;
     private static Method wctReorder;
     private static Method setFocusedTask;
+    private static Method removeTask;
     private static Object displayManager;
     private static Method getDisplayInfo;
     private static Handler handler;
@@ -57,6 +61,7 @@ final class WindowFit {
     private static Rect lastDisplay;
 
     private static final Runnable FIT = WindowFit::fitAll;
+    private static final Runnable ORPHANS = WindowFit::removeOrphans;
 
     static void start() {
         handler = new Handler(Looper.getMainLooper());
@@ -81,6 +86,7 @@ final class WindowFit {
         wctReorder = wctClass.getMethod("reorder", token, boolean.class);
         applyTransaction = windowOrganizer.getClass().getMethod("applyTransaction", wctClass);
         setFocusedTask = atm.getClass().getMethod("setFocusedTask", int.class);
+        removeTask = atm.getClass().getMethod("removeTask", int.class);
 
         Class<?> dmg = Class.forName("android.hardware.display.DisplayManagerGlobal");
         displayManager = dmg.getMethod("getInstance").invoke(null);
@@ -133,6 +139,52 @@ final class WindowFit {
     private static void schedule() {
         handler.removeCallbacks(FIT);
         handler.postDelayed(FIT, SETTLE_MS);
+        handler.removeCallbacks(ORPHANS);
+        handler.postDelayed(ORPHANS, SETTLE_MS);
+    }
+
+    /**
+     * Removes a task its app left with none of its activities and no
+     * process, such as one force-stopped under Android's permission prompt:
+     * its card showed only the leftover, and a launch fronted the task
+     * without starting the app.
+     */
+    private static void removeOrphans() {
+        try {
+            Set<String> running = null;
+            for (Object root : (List<?>) getAllRootTaskInfos.invoke(atm)) {
+                if (intField(root, "displayId") != DISPLAY) continue;
+                ComponentName real = component(root, "realActivity");
+                ComponentName base = component(root, "baseActivity");
+                ComponentName top = component(root, "topActivity");
+                if (real == null || base == null) continue;
+                String pkg = real.getPackageName();
+                if (pkg.equals(base.getPackageName()) || top != null && pkg.equals(top.getPackageName())) continue;
+                if (running == null) running = runningPackages();
+                if (running.contains(pkg)) continue;
+                int taskId = intField(root, "taskId");
+                removeTask.invoke(atm, taskId);
+                Log.i(TAG, "removed task " + taskId + ": " + pkg + " left only " + base.getPackageName());
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "orphan check failed", t);
+        }
+    }
+
+    private static Set<String> runningPackages() throws Exception {
+        Context c = (Context) Class.forName("android.app.ActivityThread")
+                .getMethod("currentApplication").invoke(null);
+        Set<String> out = new HashSet<>();
+        for (ActivityManager.RunningAppProcessInfo p : c.getSystemService(ActivityManager.class).getRunningAppProcesses()) {
+            if (p.pkgList != null)
+                for (String pkg : p.pkgList)
+                    out.add(pkg);
+        }
+        return out;
+    }
+
+    private static ComponentName component(Object taskInfo, String field) throws Exception {
+        return (ComponentName) taskInfo.getClass().getField(field).get(taskInfo);
     }
 
     private static Rect displayBounds() throws Exception {

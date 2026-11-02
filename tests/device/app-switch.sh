@@ -1,6 +1,6 @@
 #!/bin/sh
 # App switching between two Android apps, on the phone, as root:
-#   ssh root@PHONE 'sh -s -- [matrix|first-launch [N]|all]' < tests/device/app-switch.sh
+#   ssh root@PHONE 'sh -s -- [matrix|first-launch [N]|relaunch [N]|all]' < tests/device/app-switch.sh
 # matrix: launch, home, switcher and closed-card switches in both
 # directions, and a switch to an app killed in the background. Each step
 # checks Marathon's front app (Navigation1.GetForegroundApp) and Android's
@@ -8,6 +8,9 @@
 # that DeckardSystem never followed another app to the front.
 # first-launch: N fresh sessions, launching APP_A in each; reports the time
 # from Android's START to the composer's window and any transition timeout.
+# relaunch: N times, APP_A force-stopped while its permission prompt is up,
+# then home and APP_A launched again within a second; it must start (a task
+# left holding only the prompt used to swallow the launch).
 # Restarts the Deckard session (never the container) and drives the screen
 # with a uinput touchscreen, so nothing else may use the phone meanwhile.
 #
@@ -229,11 +232,30 @@ first_launch() {
 	go_home
 }
 
+relaunch() {
+	runs=${1:-10}
+	n=1
+	while [ $n -le "$runs" ]; do
+		android pm revoke "$APP_A" android.permission.POST_NOTIFICATIONS 2>/dev/null
+		android pm clear-permission-flags "$APP_A" android.permission.POST_NOTIFICATIONS user-set user-fixed 2>/dev/null
+		launch "$APP_A"
+		android logcat -c
+		expect "relaunch $n: $APP_A with its prompt" "$APP_A"
+		android am force-stop "$APP_A"
+		go_home
+		launch "$APP_A"
+		expect "relaunch $n: $APP_A after a force-stop" "$APP_A"
+		n=$((n + 1))
+	done
+	go_home
+}
+
 case ${1:-all} in
 	matrix) matrix ;;
 	first-launch) first_launch "${2:-5}" ;;
-	all) matrix; first_launch "${2:-5}" ;;
-	*) echo "usage: app-switch.sh [matrix|first-launch [N]|all [N]]" >&2; exit 2 ;;
+	relaunch) relaunch "${2:-10}" ;;
+	all) matrix; first_launch "${2:-5}"; relaunch 10 ;;
+	*) echo "usage: app-switch.sh [matrix|first-launch [N]|relaunch [N]|all [N]]" >&2; exit 2 ;;
 esac
 log "$failures failed"
 [ "$failures" = 0 ]
