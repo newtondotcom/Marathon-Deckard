@@ -1,0 +1,13 @@
+[Unit]
+Description=Host cameras for Android apps (Deckard)
+ConditionUser=!root
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=/usr/libexec/deckard-camera
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target
