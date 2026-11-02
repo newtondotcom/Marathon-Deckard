@@ -21,8 +21,13 @@ const WAIT: Duration = Duration::from_secs(5);
 const QUIET: Duration = Duration::from_millis(200);
 
 /// A prompt the fake Shell holds: app id, permission, options, and where its
-/// answer goes.
-type Prompt = (String, String, Value, async_channel::Sender<(String, bool)>);
+/// answer (answer, precise, limited) goes.
+type Prompt = (
+    String,
+    String,
+    Value,
+    async_channel::Sender<(String, bool, bool)>,
+);
 
 /// The Shell's Permissions1: holds each prompt until the test answers it.
 struct Permissions(mpsc::Sender<Prompt>, mpsc::Sender<String>);
@@ -48,10 +53,11 @@ impl Permissions {
         self.0
             .send((app, permission, options.collect(), answer))
             .unwrap();
-        let (answer, precise) = answered.recv().await.unwrap();
+        let (answer, precise, limited) = answered.recv().await.unwrap();
         VariantMap::from([
             ("answer".to_owned(), OwnedValue::from(Str::from(answer))),
             ("precise".to_owned(), precise.into()),
+            ("limited".to_owned(), limited.into()),
         ])
     }
 
@@ -85,7 +91,10 @@ fn ask(id: &str, perms: &[&str], extra: Value) -> Map<String, Value> {
 }
 
 fn answer(prompt: &Prompt, answer: &str, precise: bool) {
-    prompt.3.send_blocking((answer.into(), precise)).unwrap();
+    prompt
+        .3
+        .send_blocking((answer.into(), precise, false))
+        .unwrap();
 }
 
 fn reply(sent: &Receiver<Map<String, Value>>) -> Value {
@@ -113,8 +122,7 @@ fn cxx_permission_prompts_and_settings() -> Result<(), Box<dyn std::error::Error
     let tx = Mutex::new(tx);
     let send = Arc::new(move |message| tx.lock().unwrap().send(message).is_ok());
     let prompter = PermissionPrompts::new(bus.clone(), send);
-    let unsupported =
-        |id| json!({"t":"perm_answer", "id":id, "answer":"unsupported", "precise":false});
+    let unsupported = |id| json!({"t":"perm_answer", "id":id, "answer":"unsupported", "precise":false, "limited":false});
 
     // Without the Shell, Android asks.
     prompter.handle(&ask("0000000000000010", &["RECORD_AUDIO"], json!({})));
@@ -139,12 +147,12 @@ fn cxx_permission_prompts_and_settings() -> Result<(), Box<dyn std::error::Error
         ("deckard.me.hackerchick.catima", "camera")
     );
     let options = json!({"request":"0123456789abcdef", "kind":"foreground", "once":true,
-        "accuracy":"", "preciseDefault":false});
+        "accuracy":"", "preciseDefault":false, "limited":false});
     assert_eq!(prompt.2, options);
     assert!(sent.try_recv().is_err());
     answer(&prompt, "once", false);
-    let once =
-        json!({"t":"perm_answer", "id":"0123456789abcdef", "answer":"once", "precise":false});
+    let once = json!({"t":"perm_answer", "id":"0123456789abcdef", "answer":"once",
+        "precise":false, "limited":false});
     assert_eq!(reply(&sent), once);
 
     // Location keeps its choices.
@@ -176,11 +184,18 @@ fn cxx_permission_prompts_and_settings() -> Result<(), Box<dyn std::error::Error
         "READ_MEDIA_VISUAL_USER_SELECTED",
         "ACCESS_MEDIA_LOCATION",
     ];
-    prompter.handle(&ask("00000000000000ac", &photos, json!({})));
+    prompter.handle(&ask("00000000000000ac", &photos, json!({"limited":true})));
     let prompt = shown.recv_timeout(WAIT)?;
-    assert_eq!(prompt.1, "storage");
-    answer(&prompt, "deny", false);
-    assert_eq!(reply(&sent)["answer"], "deny");
+    assert_eq!(
+        (prompt.1.as_str(), &prompt.2["limited"]),
+        ("storage", &json!(true))
+    );
+    prompt.3.send_blocking(("allow".into(), false, true))?;
+    let picked = reply(&sent);
+    assert_eq!(
+        (&picked["answer"], &picked["limited"]),
+        (&json!("allow"), &json!(true))
+    );
 
     // Requests Marathon can't draw go back to Android's own dialog.
     let bad = [
@@ -205,6 +220,7 @@ fn cxx_permission_prompts_and_settings() -> Result<(), Box<dyn std::error::Error
         ask("0000000000000005", &["CAMERA"], json!({"accuracy":"fine"})),
         ask("0000000000000006", &["CAMERA"], json!({"pkg":"bad pkg"})),
         ask("0000000000000007", &["CAMERA"], json!({"once":"yes"})),
+        ask("000000000000000a", &["CAMERA"], json!({"limited":"yes"})),
     ];
     for message in &bad {
         prompter.handle(message);

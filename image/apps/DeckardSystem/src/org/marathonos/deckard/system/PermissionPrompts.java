@@ -31,7 +31,7 @@ import java.util.Map;
  */
 public final class PermissionPrompts extends ContentProvider {
     interface Answer {
-        void onAnswer(String answer, boolean precise);
+        void onAnswer(String answer, boolean precise, boolean limited);
     }
 
     private static final String CONTROLLER = "com.android.permissioncontroller";
@@ -44,7 +44,7 @@ public final class PermissionPrompts extends ContentProvider {
 
     /** Sends one question; false when deckardd isn't there to ask. */
     static boolean ask(String id, String pkg, List<String> perms, String kind, boolean once, String accuracy,
-            boolean preciseDefault, Answer answer) {
+            boolean preciseDefault, boolean limited, Answer answer) {
         if (!HostLink.get().isConnected())
             return false;
         synchronized (WAITING) {
@@ -53,7 +53,7 @@ public final class PermissionPrompts extends ContentProvider {
         try {
             HostLink.get().send(new JSONObject().put("t", "perm_ask").put("id", id).put("pkg", pkg)
                     .put("perms", new JSONArray(perms)).put("kind", kind).put("once", once)
-                    .put("accuracy", accuracy).put("preciseDefault", preciseDefault));
+                    .put("accuracy", accuracy).put("preciseDefault", preciseDefault).put("limited", limited));
         } catch (JSONException e) {
             synchronized (WAITING) {
                 WAITING.remove(id);
@@ -77,7 +77,8 @@ public final class PermissionPrompts extends ContentProvider {
 
     /** perm_answer from deckardd. */
     static void handle(JSONObject m) {
-        answered(m.optString("id"), m.optString("answer", "cancel"), m.optBoolean("precise"));
+        answered(m.optString("id"), m.optString("answer", "cancel"), m.optBoolean("precise"),
+                m.optBoolean("limited"));
     }
 
     /** The channel dropped: Android asks for itself. */
@@ -87,16 +88,16 @@ public final class PermissionPrompts extends ContentProvider {
             ids = new ArrayList<>(WAITING.keySet());
         }
         for (String id : ids)
-            answered(id, "unsupported", false);
+            answered(id, "unsupported", false, false);
     }
 
-    private static void answered(String id, String answer, boolean precise) {
+    private static void answered(String id, String answer, boolean precise, boolean limited) {
         Answer a;
         synchronized (WAITING) {
             a = WAITING.remove(id);
         }
         if (a != null)
-            a.onAnswer(answer, precise);
+            a.onAnswer(answer, precise, limited);
     }
 
     @Override
@@ -116,11 +117,13 @@ public final class PermissionPrompts extends ContentProvider {
             return null;
         String id = newId();
         boolean sent = ask(id, pkg, perms, extras.getString("kind", "foreground"), extras.getBoolean("once"),
-                extras.getString("accuracy", ""), extras.getBoolean("preciseDefault"), (answer, precise) -> {
+                extras.getString("accuracy", ""), extras.getBoolean("preciseDefault"), extras.getBoolean("limited"),
+                (answer, precise, limited) -> {
                     Bundle data = new Bundle();
                     data.putString("id", id);
                     data.putString("answer", answer);
                     data.putBoolean("precise", precise);
+                    data.putBoolean("limited", limited);
                     receiver.send(0, data);
                 });
         if (!sent)
