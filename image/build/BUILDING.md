@@ -67,7 +67,7 @@ those that needed changes for 23.2.
 | frameworks/libs/binary_translation | dummy riscv64-to-x86_64 intrinsics generator on arm64 hosts | new (DGX's needs 24.0 defaults) |
 | hardware/interfaces | 2.7 external camera provider prefer32 | new |
 | hardware/ril | reference-ril fails unknown call-selection requests | new |
-| packages/modules/Permission | PermissionController asks through Marathon's prompt (MarathonGrantView) | Deckard |
+| packages/modules/Permission | PermissionController asks through Marathon's prompt (MarathonGrantView), limited photo access included | Deckard |
 | prebuilts/build-tools | bison, flex, m4, make for the arm64 host | DGX |
 | prebuilts/clang/host/linux-x86 | llvm build tools from the arm64 clang | DGX, port |
 | prebuilts/jdk/jdk21 | arm64 javap and friends | DGX |
