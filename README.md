@@ -48,6 +48,8 @@ and Python Waydroid 1.6.3 that Deckard replaced. Details and method are in
 Android boots in about 12 s from a cold start. microG adds about 120 MB of
 Android memory and gives apps Google push without a Google account
 ([docs/microg.md](docs/microg.md)).
+F-Droid, with its Privileged Extension, and Aurora Store come installed
+([docs/fdroid.md](docs/fdroid.md)).
 
 ## Requirements
 
