@@ -252,7 +252,7 @@ impl MountLayout {
                 validate_path_syntax(&target)?;
                 fs::create_dir_all(&target)?;
                 let options = format!(
-                    "ro,nodev,loop,offset={offset},sizelimit={},X-mount.idmap=b:0:{USERNS_BASE}:{USERNS_IDS}",
+                    "ro,nodev,noatime,loop,offset={offset},sizelimit={},X-mount.idmap=b:0:{USERNS_BASE}:{USERNS_IDS}",
                     payload.size()
                 );
                 commands.push(Command::new([
