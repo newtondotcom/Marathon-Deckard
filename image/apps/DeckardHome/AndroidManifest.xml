@@ -23,7 +23,7 @@
             android:stateNotNeeded="true"
             android:resumeWhilePausing="true"
             android:excludeFromRecents="true"
-            android:theme="@android:style/Theme.Translucent.NoTitleBar">
+            android:theme="@style/Home">
             <intent-filter android:priority="2">
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.HOME" />

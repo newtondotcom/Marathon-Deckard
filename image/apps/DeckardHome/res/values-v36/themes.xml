@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Covers the apps below so they stop, as under a phone's launcher. -->
+    <style name="Home" parent="@android:style/Theme.Translucent.NoTitleBar">
+        <item name="android:windowIsTranslucent">false</item>
+    </style>
+</resources>
