@@ -1,0 +1,2488 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: patrickjquinn <patrick.jm.quinn@gmail.com>
+Date: Mon, 2 Nov 2026 18:03:38 +0000
+Subject: [PATCH] camera: Take frames from the host's camera service
+
+Deckard's camera provider, android.hardware.camera.provider-V1-deckard-service
+(ICameraProvider/deckard/0), is AOSP's AIDL external camera HAL with V4L2
+swapped for deckard-camera on the host: libcamera owns the sensors, and
+each frame arrives over /data/deckard/camera.sock as a dma-buf (RGBA),
+which the HAL maps and converts once to its full-range I420 working frame.
+Cropping, scaling, the YUV and JPEG outputs and EXIF stay AOSP's.
+
+Cameras follow the host's list, back first, as device@1.1/internal/<n>;
+facing and sensor orientation are libcamera's Location and Rotation. A
+camera the host has lent elsewhere opens as CAMERA_IN_USE. The cameras
+are present while a connection to the host is open.
+
+Also fixes switchToOffline wrapping a frame it does not own in a second
+shared_ptr.
+---
+ camera/Android.bp                             |  75 ++++
+ camera/ExternalCameraDevice.cpp               | 264 ++----------
+ camera/ExternalCameraDevice.h                 |  29 +-
+ camera/ExternalCameraDeviceSession.cpp        | 393 +++---------------
+ camera/ExternalCameraDeviceSession.h          |  13 +-
+ camera/ExternalCameraOfflineSession.cpp       |  27 +-
+ camera/ExternalCameraProvider.cpp             | 314 ++++----------
+ camera/ExternalCameraProvider.h               |  35 +-
+ camera/ExternalCameraUtils.cpp                |  75 ++--
+ camera/ExternalCameraUtils.h                  |  32 +-
+ camera/HostCamera.cpp                         | 314 ++++++++++++++
+ camera/HostCamera.h                           | 113 +++++
+ ...ware.camera.provider-V1-deckard-service.rc |   8 +
+ ...are.camera.provider-V1-deckard-service.xml |   7 +
+ camera/{external-service.cpp => service.cpp}  |  15 +-
+ 15 files changed, 813 insertions(+), 901 deletions(-)
+ create mode 100644 camera/Android.bp
+ create mode 100644 camera/HostCamera.cpp
+ create mode 100644 camera/HostCamera.h
+ create mode 100644 camera/android.hardware.camera.provider-V1-deckard-service.rc
+ create mode 100644 camera/android.hardware.camera.provider-V1-deckard-service.xml
+ rename camera/{external-service.cpp => service.cpp} (76%)
+
+diff --git a/camera/Android.bp b/camera/Android.bp
+new file mode 100644
+index 0000000..c180397
+--- /dev/null
++++ b/camera/Android.bp
+@@ -0,0 +1,75 @@
++//
++// Copyright (C) 2020 The Android Open Source Project
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//      http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++//
++
++// Deckard's camera provider: the host's cameras through deckard-camera.
++cc_binary {
++    name: "android.hardware.camera.provider-V1-deckard-service",
++    defaults: [
++        "android.hardware.graphics.common-ndk_shared",
++        "hidl_defaults",
++    ],
++    proprietary: true,
++    relative_install_path: "hw",
++    compile_multilib: "first",
++    init_rc: ["android.hardware.camera.provider-V1-deckard-service.rc"],
++    vintf_fragments: ["android.hardware.camera.provider-V1-deckard-service.xml"],
++    srcs: [
++        "ExternalCameraDevice.cpp",
++        "ExternalCameraDeviceSession.cpp",
++        "ExternalCameraOfflineSession.cpp",
++        "ExternalCameraProvider.cpp",
++        "ExternalCameraUtils.cpp",
++        "HostCamera.cpp",
++        "convert.cpp",
++        "service.cpp",
++    ],
++    shared_libs: [
++        "android.hardware.camera.common-V1-ndk",
++        "android.hardware.camera.device-V1-ndk",
++        "android.hardware.camera.provider-V1-ndk",
++        "android.hardware.graphics.allocator-V2-ndk",
++        "android.hardware.graphics.mapper@2.0",
++        "android.hardware.graphics.mapper@3.0",
++        "android.hardware.graphics.mapper@4.0",
++        "android.hidl.allocator@1.0",
++        "android.hidl.memory@1.0",
++        "libbase",
++        "libbinder_ndk",
++        "libcamera_metadata",
++        "libcutils",
++        "libexif",
++        "libfmq",
++        "libgralloctypes",
++        "libhardware",
++        "libhidlbase",
++        "libhidlmemory",
++        "libjpeg",
++        "liblog",
++        "libsync",
++        "libtinyxml2",
++        "libutils",
++        "libui",
++        "libyuv",
++    ],
++    static_libs: [
++        "android.hardware.camera.common@1.0-helper",
++        "libaidlcommonsupport",
++    ],
++    header_libs: [
++        "media_plugin_headers",
++    ],
++    local_include_dirs: ["."],
++}
+diff --git a/camera/ExternalCameraDevice.cpp b/camera/ExternalCameraDevice.cpp
+index 8e84748..5a6892a 100644
+--- a/camera/ExternalCameraDevice.cpp
++++ b/camera/ExternalCameraDevice.cpp
+@@ -22,8 +22,6 @@
+ 
+ #include <aidl/android/hardware/camera/common/Status.h>
+ #include <convert.h>
+-#include <linux/videodev2.h>
+-#include <regex>
+ #include <set>
+ 
+ namespace android {
+@@ -34,32 +32,12 @@ namespace implementation {
+ 
+ using ::aidl::android::hardware::camera::common::Status;
+ 
+-namespace {
+-// Only support MJPEG for now as it seems to be the one supports higher fps
+-// Other formats to consider in the future:
+-// * V4L2_PIX_FMT_YVU420 (== YV12)
+-// * V4L2_PIX_FMT_YVYU (YVYU: can be converted to YV12 or other YUV420_888 formats)
+-const std::array<uint32_t, /*size*/ 2> kSupportedFourCCs{
+-        {V4L2_PIX_FMT_MJPEG, V4L2_PIX_FMT_Z16}};  // double braces required in C++11
+-
+-constexpr int MAX_RETRY = 5;                  // Allow retry v4l2 open failures a few times.
+-constexpr int OPEN_RETRY_SLEEP_US = 100'000;  // 100ms * MAX_RETRY = 0.5 seconds
+-
+-const std::regex kDevicePathRE("/dev/video([0-9]+)");
+-}  // namespace
+-
+ std::string ExternalCameraDevice::kDeviceVersion = "1.1";
+ 
+-ExternalCameraDevice::ExternalCameraDevice(const std::string& devicePath,
++ExternalCameraDevice::ExternalCameraDevice(const deckard::HostCameraInfo& info,
++                                           const std::string& cameraId,
+                                            const ExternalCameraConfig& config)
+-    : mCameraId("-1"), mDevicePath(devicePath), mCfg(config) {
+-    std::smatch sm;
+-    if (std::regex_match(mDevicePath, sm, kDevicePathRE)) {
+-        mCameraId = std::to_string(mCfg.cameraIdOffset + std::stoi(sm[1]));
+-    } else {
+-        ALOGE("%s: device path match failed for %s", __FUNCTION__, mDevicePath.c_str());
+-    }
+-}
++    : mCameraId(cameraId), mCfg(config), mInfo(info) {}
+ 
+ ExternalCameraDevice::~ExternalCameraDevice() {}
+ 
+@@ -130,25 +108,24 @@ ndk::ScopedAStatus ExternalCameraDevice::open(
+         return fromStatus(Status::CAMERA_IN_USE);
+     }
+ 
+-    int numAttempt = 0;
+-    unique_fd fd(::open(mDevicePath.c_str(), O_RDWR));
+-    while (fd.get() < 0 && numAttempt < MAX_RETRY) {
+-        // Previous retry attempts failed. Retry opening the device at most MAX_RETRY times
+-        ALOGW("%s: v4l2 device %s open failed, wait 33ms and try again", __FUNCTION__,
+-              mDevicePath.c_str());
+-        usleep(OPEN_RETRY_SLEEP_US);  // sleep and try again
+-        fd.reset(::open(mDevicePath.c_str(), O_RDWR));
+-        numAttempt++;
+-    }
+-
+-    if (fd.get() < 0) {
+-        ALOGE("%s: v4l2 device open %s failed: %s", __FUNCTION__, mDevicePath.c_str(),
+-              strerror(errno));
++    std::shared_ptr<deckard::HostConnection> host = deckard::HostConnection::connect();
++    if (host == nullptr) {
++        ALOGE("%s: camera %s: the host is not there", __FUNCTION__, mCameraId.c_str());
+         return fromStatus(Status::INTERNAL_ERROR);
+     }
++    switch (host->open(mInfo.index)) {
++        case deckard::HostError::NONE:
++            break;
++        case deckard::HostError::BUSY:
++            ALOGW("%s: camera %s is in use on the host", __FUNCTION__, mCameraId.c_str());
++            return fromStatus(Status::CAMERA_IN_USE);
++        default:
++            ALOGE("%s: camera %s did not open on the host", __FUNCTION__, mCameraId.c_str());
++            return fromStatus(Status::INTERNAL_ERROR);
++    }
+ 
+     session = createSession(in_callback, mCfg, mSupportedFormats, mCroppingType,
+-                            mCameraCharacteristics, mCameraId, std::move(fd));
++                            mCameraCharacteristics, mCameraId, std::move(host));
+     if (session == nullptr) {
+         ALOGE("%s: camera device session allocation failed", __FUNCTION__);
+         return fromStatus(Status::INTERNAL_ERROR);
+@@ -185,9 +162,9 @@ std::shared_ptr<ExternalCameraDeviceSession> ExternalCameraDevice::createSession
+         const std::shared_ptr<ICameraDeviceCallback>& cb, const ExternalCameraConfig& cfg,
+         const std::vector<SupportedV4L2Format>& sortedFormats, const CroppingType& croppingType,
+         const common::V1_0::helper::CameraMetadata& chars, const std::string& cameraId,
+-        unique_fd v4l2Fd) {
++        std::shared_ptr<deckard::HostConnection> host) {
+     return ndk::SharedRefBase::make<ExternalCameraDeviceSession>(
+-            cb, cfg, sortedFormats, croppingType, chars, cameraId, std::move(v4l2Fd));
++            cb, cfg, sortedFormats, croppingType, chars, cameraId, std::move(host));
+ }
+ 
+ bool ExternalCameraDevice::isInitFailed() {
+@@ -207,13 +184,11 @@ bool ExternalCameraDevice::isInitFailedLocked() {
+     return mInitFailed;
+ }
+ 
+-void ExternalCameraDevice::initSupportedFormatsLocked(int fd) {
++void ExternalCameraDevice::initSupportedFormatsLocked() {
+     std::vector<SupportedV4L2Format> horizontalFmts =
+-            getCandidateSupportedFormatsLocked(fd, HORIZONTAL, mCfg.fpsLimits, mCfg.depthFpsLimits,
+-                                               mCfg.minStreamSize, mCfg.depthEnabled);
++            getCandidateSupportedFormatsLocked(HORIZONTAL, mCfg.minStreamSize);
+     std::vector<SupportedV4L2Format> verticalFmts =
+-            getCandidateSupportedFormatsLocked(fd, VERTICAL, mCfg.fpsLimits, mCfg.depthFpsLimits,
+-                                               mCfg.minStreamSize, mCfg.depthEnabled);
++            getCandidateSupportedFormatsLocked(VERTICAL, mCfg.minStreamSize);
+ 
+     size_t horiSize = horizontalFmts.size();
+     size_t vertSize = verticalFmts.size();
+@@ -269,13 +244,6 @@ status_t ExternalCameraDevice::initCameraCharacteristics() {
+         return OK;
+     }
+ 
+-    // init camera characteristics
+-    unique_fd fd(::open(mDevicePath.c_str(), O_RDWR));
+-    if (fd.get() < 0) {
+-        ALOGE("%s: v4l2 device open %s failed", __FUNCTION__, mDevicePath.c_str());
+-        return DEAD_OBJECT;
+-    }
+-
+     status_t ret;
+     ret = initDefaultCharsKeys(&mCameraCharacteristics);
+     if (ret != OK) {
+@@ -284,14 +252,14 @@ status_t ExternalCameraDevice::initCameraCharacteristics() {
+         return ret;
+     }
+ 
+-    ret = initCameraControlsCharsKeys(fd.get(), &mCameraCharacteristics);
++    ret = initCameraControlsCharsKeys(&mCameraCharacteristics);
+     if (ret != OK) {
+         ALOGE("%s: init camera control characteristics key failed: errorno %d", __FUNCTION__, ret);
+         mCameraCharacteristics.clear();
+         return ret;
+     }
+ 
+-    ret = initOutputCharsKeys(fd.get(), &mCameraCharacteristics);
++    ret = initOutputCharsKeys(&mCameraCharacteristics);
+     if (ret != OK) {
+         ALOGE("%s: init output characteristics key failed: errorno %d", __FUNCTION__, ret);
+         mCameraCharacteristics.clear();
+@@ -324,14 +292,10 @@ status_t ExternalCameraDevice::initAvailableCapabilities(
+         return UNKNOWN_ERROR;
+     }
+ 
+-    bool hasDepth = false;
+     bool hasColor = false;
+     for (const auto& fmt : mSupportedFormats) {
+         switch (fmt.fourcc) {
+-            case V4L2_PIX_FMT_Z16:
+-                hasDepth = true;
+-                break;
+-            case V4L2_PIX_FMT_MJPEG:
++            case deckard::kHostFourcc:
+                 hasColor = true;
+                 break;
+             default:
+@@ -340,9 +304,6 @@ status_t ExternalCameraDevice::initAvailableCapabilities(
+     }
+ 
+     std::vector<uint8_t> availableCapabilities;
+-    if (hasDepth) {
+-        availableCapabilities.push_back(ANDROID_REQUEST_AVAILABLE_CAPABILITIES_DEPTH_OUTPUT);
+-    }
+     if (hasColor) {
+         availableCapabilities.push_back(ANDROID_REQUEST_AVAILABLE_CAPABILITIES_BACKWARD_COMPATIBLE);
+     }
+@@ -420,7 +381,7 @@ status_t ExternalCameraDevice::initDefaultCharsKeys(
+     const uint8_t opticalStabilizationMode = ANDROID_LENS_OPTICAL_STABILIZATION_MODE_OFF;
+     UPDATE(ANDROID_LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION, &opticalStabilizationMode, 1);
+ 
+-    const uint8_t facing = ANDROID_LENS_FACING_EXTERNAL;
++    const uint8_t facing = mInfo.facing;
+     UPDATE(ANDROID_LENS_FACING, &facing, 1);
+ 
+     // android.noiseReduction
+@@ -468,12 +429,8 @@ status_t ExternalCameraDevice::initDefaultCharsKeys(
+     const uint8_t timestampSource = ANDROID_SENSOR_INFO_TIMESTAMP_SOURCE_UNKNOWN;
+     UPDATE(ANDROID_SENSOR_INFO_TIMESTAMP_SOURCE, &timestampSource, 1);
+ 
+-    // Orientation is a bit odd for external camera, but consider it as the orientation
+-    // between the external camera sensor (which is usually landscape) and the device's
+-    // natural display orientation. For devices with natural landscape display (ex: tablet/TV), the
+-    // orientation should be 0. For devices with natural portrait display (phone), the orientation
+-    // should be 270.
+-    const int32_t orientation = mCfg.orientation;
++    // libcamera's Rotation is Android's sensor orientation.
++    const int32_t orientation = mInfo.rotation;
+     UPDATE(ANDROID_SENSOR_ORIENTATION, &orientation, 1);
+ 
+     // android.shading
+@@ -583,7 +540,7 @@ status_t ExternalCameraDevice::initDefaultCharsKeys(
+ }
+ 
+ status_t ExternalCameraDevice::initCameraControlsCharsKeys(
+-        int, ::android::hardware::camera::common::V1_0::helper::CameraMetadata* metadata) {
++        ::android::hardware::camera::common::V1_0::helper::CameraMetadata* metadata) {
+     // android.sensor.info.sensitivityRange   -> V4L2_CID_ISO_SENSITIVITY
+     // android.sensor.info.exposureTimeRange  -> V4L2_CID_EXPOSURE_ABSOLUTE
+     // android.sensor.info.maxFrameDuration   -> TBD
+@@ -624,28 +581,21 @@ status_t ExternalCameraDevice::initCameraControlsCharsKeys(
+ }
+ 
+ status_t ExternalCameraDevice::initOutputCharsKeys(
+-        int fd, ::android::hardware::camera::common::V1_0::helper::CameraMetadata* metadata) {
+-    initSupportedFormatsLocked(fd);
++        ::android::hardware::camera::common::V1_0::helper::CameraMetadata* metadata) {
++    initSupportedFormatsLocked();
+     if (mSupportedFormats.empty()) {
+         ALOGE("%s: Init supported format list failed", __FUNCTION__);
+         return UNKNOWN_ERROR;
+     }
+ 
+-    bool hasDepth = false;
+     bool hasColor = false;
+ 
+-    // For V4L2_PIX_FMT_Z16
+-    std::array<int, /*size*/ 1> halDepthFormats{{HAL_PIXEL_FORMAT_Y16}};
+-    // For V4L2_PIX_FMT_MJPEG
+     std::array<int, /*size*/ 3> halFormats{{HAL_PIXEL_FORMAT_BLOB, HAL_PIXEL_FORMAT_YCbCr_420_888,
+                                             HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED}};
+ 
+     for (const auto& supportedFormat : mSupportedFormats) {
+         switch (supportedFormat.fourcc) {
+-            case V4L2_PIX_FMT_Z16:
+-                hasDepth = true;
+-                break;
+-            case V4L2_PIX_FMT_MJPEG:
++            case deckard::kHostFourcc:
+                 hasColor = true;
+                 break;
+             default:
+@@ -655,22 +605,9 @@ status_t ExternalCameraDevice::initOutputCharsKeys(
+         }
+     }
+ 
+-    if (hasDepth) {
+-        status_t ret = initOutputCharsKeysByFormat(
+-                metadata, V4L2_PIX_FMT_Z16, halDepthFormats,
+-                ANDROID_DEPTH_AVAILABLE_DEPTH_STREAM_CONFIGURATIONS_OUTPUT,
+-                ANDROID_DEPTH_AVAILABLE_DEPTH_STREAM_CONFIGURATIONS,
+-                ANDROID_DEPTH_AVAILABLE_DEPTH_MIN_FRAME_DURATIONS,
+-                ANDROID_DEPTH_AVAILABLE_DEPTH_STALL_DURATIONS);
+-        if (ret != OK) {
+-            ALOGE("%s: Unable to initialize depth format keys: %s", __FUNCTION__,
+-                  statusToString(ret).c_str());
+-            return ret;
+-        }
+-    }
+     if (hasColor) {
+         status_t ret =
+-                initOutputCharsKeysByFormat(metadata, V4L2_PIX_FMT_MJPEG, halFormats,
++                initOutputCharsKeysByFormat(metadata, deckard::kHostFourcc, halFormats,
+                                             ANDROID_SCALER_AVAILABLE_STREAM_CONFIGURATIONS_OUTPUT,
+                                             ANDROID_SCALER_AVAILABLE_STREAM_CONFIGURATIONS,
+                                             ANDROID_SCALER_AVAILABLE_MIN_FRAME_DURATIONS,
+@@ -807,137 +744,22 @@ status_t ExternalCameraDevice::calculateMinFps(
+ #undef ARRAY_SIZE
+ #undef UPDATE
+ 
+-void ExternalCameraDevice::getFrameRateList(int fd, double fpsUpperBound,
+-                                            SupportedV4L2Format* format) {
+-    format->frameRates.clear();
+-
+-    v4l2_frmivalenum frameInterval{
+-            .index = 0,
+-            .pixel_format = format->fourcc,
+-            .width = static_cast<__u32>(format->width),
+-            .height = static_cast<__u32>(format->height),
+-    };
+-
+-    for (frameInterval.index = 0;
+-         TEMP_FAILURE_RETRY(ioctl(fd, VIDIOC_ENUM_FRAMEINTERVALS, &frameInterval)) == 0;
+-         ++frameInterval.index) {
+-        if (frameInterval.type == V4L2_FRMIVAL_TYPE_DISCRETE) {
+-            if (frameInterval.discrete.numerator != 0) {
+-                SupportedV4L2Format::FrameRate fr = {frameInterval.discrete.numerator,
+-                                                     frameInterval.discrete.denominator};
+-                double framerate = fr.getFramesPerSecond();
+-                if (framerate > fpsUpperBound) {
+-                    continue;
+-                }
+-                ALOGV("index:%d, format:%c%c%c%c, w %d, h %d, framerate %f", frameInterval.index,
+-                      frameInterval.pixel_format & 0xFF, (frameInterval.pixel_format >> 8) & 0xFF,
+-                      (frameInterval.pixel_format >> 16) & 0xFF,
+-                      (frameInterval.pixel_format >> 24) & 0xFF, frameInterval.width,
+-                      frameInterval.height, framerate);
+-                format->frameRates.push_back(fr);
+-            }
+-        }
+-    }
+-
+-    if (format->frameRates.empty()) {
+-        ALOGE("%s: failed to get supported frame rates for format:%c%c%c%c w %d h %d", __FUNCTION__,
+-              frameInterval.pixel_format & 0xFF, (frameInterval.pixel_format >> 8) & 0xFF,
+-              (frameInterval.pixel_format >> 16) & 0xFF, (frameInterval.pixel_format >> 24) & 0xFF,
+-              frameInterval.width, frameInterval.height);
+-    }
+-}
+-
+-void ExternalCameraDevice::updateFpsBounds(
+-        int fd, CroppingType cropType,
+-        const std::vector<ExternalCameraConfig::FpsLimitation>& fpsLimits,
+-        SupportedV4L2Format format, std::vector<SupportedV4L2Format>& outFmts) {
+-    double fpsUpperBound = -1.0;
+-    for (const auto& limit : fpsLimits) {
+-        if (cropType == VERTICAL) {
+-            if (format.width <= limit.size.width) {
+-                fpsUpperBound = limit.fpsUpperBound;
+-                break;
+-            }
+-        } else {  // HORIZONTAL
+-            if (format.height <= limit.size.height) {
+-                fpsUpperBound = limit.fpsUpperBound;
+-                break;
+-            }
+-        }
+-    }
+-    if (fpsUpperBound < 0.f) {
+-        return;
+-    }
+-
+-    getFrameRateList(fd, fpsUpperBound, &format);
+-    if (!format.frameRates.empty()) {
+-        outFmts.push_back(format);
+-    }
+-}
+-
+ std::vector<SupportedV4L2Format> ExternalCameraDevice::getCandidateSupportedFormatsLocked(
+-        int fd, CroppingType cropType,
+-        const std::vector<ExternalCameraConfig::FpsLimitation>& fpsLimits,
+-        const std::vector<ExternalCameraConfig::FpsLimitation>& depthFpsLimits,
+-        const Size& minStreamSize, bool depthEnabled) {
++        CroppingType cropType, const Size& minStreamSize) {
+     std::vector<SupportedV4L2Format> outFmts;
+-    struct v4l2_fmtdesc fmtdesc {
+-        .index = 0, .type = V4L2_BUF_TYPE_VIDEO_CAPTURE
+-    };
+-    int ret = 0;
+-    while (ret == 0) {
+-        ret = TEMP_FAILURE_RETRY(ioctl(fd, VIDIOC_ENUM_FMT, &fmtdesc));
+-        ALOGV("index:%d,ret:%d, format:%c%c%c%c", fmtdesc.index, ret, fmtdesc.pixelformat & 0xFF,
+-              (fmtdesc.pixelformat >> 8) & 0xFF, (fmtdesc.pixelformat >> 16) & 0xFF,
+-              (fmtdesc.pixelformat >> 24) & 0xFF);
+-
+-        if (ret != 0 || (fmtdesc.flags & V4L2_FMT_FLAG_EMULATED)) {
+-            // Skip if IOCTL failed, or if the format is emulated
+-            fmtdesc.index++;
++    for (const auto& size : mInfo.sizes) {
++        // Disregard h > w formats so all aspect ratio (h/w) <= 1.0
++        // This will simplify the crop/scaling logic down the road
++        if (size.height > size.width || size.fps == 0) {
+             continue;
+         }
+-        auto it =
+-                std::find(kSupportedFourCCs.begin(), kSupportedFourCCs.end(), fmtdesc.pixelformat);
+-        if (it == kSupportedFourCCs.end()) {
+-            fmtdesc.index++;
++        if (size.width < minStreamSize.width || size.height < minStreamSize.height) {
+             continue;
+         }
+-
+-        // Found supported format
+-        v4l2_frmsizeenum frameSize{.index = 0, .pixel_format = fmtdesc.pixelformat};
+-        for (; TEMP_FAILURE_RETRY(ioctl(fd, VIDIOC_ENUM_FRAMESIZES, &frameSize)) == 0;
+-             ++frameSize.index) {
+-            if (frameSize.type == V4L2_FRMSIZE_TYPE_DISCRETE) {
+-                ALOGV("index:%d, format:%c%c%c%c, w %d, h %d", frameSize.index,
+-                      fmtdesc.pixelformat & 0xFF, (fmtdesc.pixelformat >> 8) & 0xFF,
+-                      (fmtdesc.pixelformat >> 16) & 0xFF, (fmtdesc.pixelformat >> 24) & 0xFF,
+-                      frameSize.discrete.width, frameSize.discrete.height);
+-
+-                // Disregard h > w formats so all aspect ratio (h/w) <= 1.0
+-                // This will simplify the crop/scaling logic down the road
+-                if (frameSize.discrete.height > frameSize.discrete.width) {
+-                    continue;
+-                }
+-
+-                // Discard all formats which is smaller than minStreamSize
+-                if (frameSize.discrete.width < minStreamSize.width ||
+-                    frameSize.discrete.height < minStreamSize.height) {
+-                    continue;
+-                }
+-
+-                SupportedV4L2Format format{
+-                        .width = static_cast<int32_t>(frameSize.discrete.width),
+-                        .height = static_cast<int32_t>(frameSize.discrete.height),
+-                        .fourcc = fmtdesc.pixelformat};
+-
+-                if (format.fourcc == V4L2_PIX_FMT_Z16 && depthEnabled) {
+-                    updateFpsBounds(fd, cropType, depthFpsLimits, format, outFmts);
+-                } else {
+-                    updateFpsBounds(fd, cropType, fpsLimits, format, outFmts);
+-                }
+-            }
+-        }
+-        fmtdesc.index++;
++        outFmts.push_back({.width = size.width,
++                           .height = size.height,
++                           .fourcc = deckard::kHostFourcc,
++                           .frameRates = {{1, size.fps}}});
+     }
+     trimSupportedFormats(cropType, &outFmts);
+     return outFmts;
+diff --git a/camera/ExternalCameraDevice.h b/camera/ExternalCameraDevice.h
+index bcae194..9a4c182 100644
+--- a/camera/ExternalCameraDevice.h
++++ b/camera/ExternalCameraDevice.h
+@@ -43,7 +43,8 @@ class ExternalCameraDevice : public BnCameraDevice {
+     // be multiple CameraDevice trying to access the same physical camera.  Also, provider will have
+     // to keep track of all CameraDevice objects in order to notify CameraDevice when the underlying
+     // camera is detached.
+-    ExternalCameraDevice(const std::string& devicePath, const ExternalCameraConfig& config);
++    ExternalCameraDevice(const deckard::HostCameraInfo& info, const std::string& cameraId,
++                         const ExternalCameraConfig& config);
+     ~ExternalCameraDevice() override;
+ 
+     ndk::ScopedAStatus getCameraCharacteristics(CameraMetadata* _aidl_return) override;
+@@ -75,12 +76,12 @@ class ExternalCameraDevice : public BnCameraDevice {
+             const std::shared_ptr<ICameraDeviceCallback>&, const ExternalCameraConfig& cfg,
+             const std::vector<SupportedV4L2Format>& sortedFormats, const CroppingType& croppingType,
+             const common::V1_0::helper::CameraMetadata& chars, const std::string& cameraId,
+-            unique_fd v4l2Fd);
++            std::shared_ptr<deckard::HostConnection> host);
+ 
+     bool isInitFailedLocked();
+ 
+     // Init supported w/h/format/fps in mSupportedFormats. Caller still owns fd
+-    void initSupportedFormatsLocked(int fd);
++    void initSupportedFormatsLocked();
+ 
+     // Calls into virtual member function. Do not use it in constructor
+     status_t initCameraCharacteristics();
+@@ -92,10 +93,10 @@ class ExternalCameraDevice : public BnCameraDevice {
+             ::android::hardware::camera::common::V1_0::helper::CameraMetadata*);
+     // Init camera control chars keys. Caller still owns fd
+     status_t initCameraControlsCharsKeys(
+-            int fd, ::android::hardware::camera::common::V1_0::helper::CameraMetadata*);
++            ::android::hardware::camera::common::V1_0::helper::CameraMetadata*);
+     // Init camera output configuration related keys.  Caller still owns fd
+     status_t initOutputCharsKeys(
+-            int fd, ::android::hardware::camera::common::V1_0::helper::CameraMetadata*);
++            ::android::hardware::camera::common::V1_0::helper::CameraMetadata*);
+ 
+     // Helper function for initOutputCharskeys
+     template <size_t SIZE>
+@@ -106,20 +107,8 @@ class ExternalCameraDevice : public BnCameraDevice {
+ 
+     status_t calculateMinFps(::android::hardware::camera::common::V1_0::helper::CameraMetadata*);
+ 
+-    static void getFrameRateList(int fd, double fpsUpperBound, SupportedV4L2Format* format);
+-
+-    static void updateFpsBounds(int fd, CroppingType cropType,
+-                                const std::vector<ExternalCameraConfig::FpsLimitation>& fpsLimits,
+-                                SupportedV4L2Format format,
+-                                std::vector<SupportedV4L2Format>& outFmts);
+-
+-    // Get candidate supported formats list of input cropping type.
+-    static std::vector<SupportedV4L2Format> getCandidateSupportedFormatsLocked(
+-            int fd, CroppingType cropType,
+-            const std::vector<ExternalCameraConfig::FpsLimitation>& fpsLimits,
+-            const std::vector<ExternalCameraConfig::FpsLimitation>& depthFpsLimits,
+-            const Size& minStreamSize, bool depthEnabled);
+-    // Trim supported format list by the cropping type. Also sort output formats by width/height
++    std::vector<SupportedV4L2Format> getCandidateSupportedFormatsLocked(
++            CroppingType cropType, const Size& minStreamSize);
+     static void trimSupportedFormats(CroppingType cropType,
+                                      /*inout*/ std::vector<SupportedV4L2Format>* pFmts);
+ 
+@@ -127,7 +116,7 @@ class ExternalCameraDevice : public BnCameraDevice {
+     bool mInitialized = false;
+     bool mInitFailed = false;
+     std::string mCameraId;
+-    std::string mDevicePath;
++    const deckard::HostCameraInfo mInfo;
+     const ExternalCameraConfig& mCfg;
+     std::vector<SupportedV4L2Format> mSupportedFormats;
+     CroppingType mCroppingType;
+diff --git a/camera/ExternalCameraDeviceSession.cpp b/camera/ExternalCameraDeviceSession.cpp
+index 4e90a67..ff2c77c 100644
+--- a/camera/ExternalCameraDeviceSession.cpp
++++ b/camera/ExternalCameraDeviceSession.cpp
+@@ -33,10 +33,12 @@
+ #include <aidl/android/hardware/camera/device/StreamType.h>
+ #include <aidl/android/hardware/graphics/common/Dataspace.h>
+ #include <aidlcommonsupport/NativeHandle.h>
++#include <android-base/properties.h>
+ #include <convert.h>
+ #include <linux/videodev2.h>
+ #include <sync/sync.h>
+ #include <utils/Trace.h>
++#include <cmath>
+ #include <deque>
+ 
+ #define HAVE_JPEG  // required for libyuv.h to export MJPEG decode APIs
+@@ -54,12 +56,7 @@ namespace {
+ // Size of request/result metadata fast message queue. Change to 0 to always use hwbinder buffer.
+ static constexpr size_t kMetadataMsgQueueSize = 1 << 18 /* 256kB */;
+ 
+-const int kBadFramesAfterStreamOn = 1;  // drop x frames after streamOn to get rid of some initial
+-                                        // bad frames. TODO: develop a better bad frame detection
+-                                        // method
+-constexpr int MAX_RETRY = 15;  // Allow retry some ioctl failures a few times to account for some
+-                               // webcam showing temporarily ioctl failures.
+-constexpr int IOCTL_RETRY_SLEEP_US = 33000;  // 33ms * MAX_RETRY = 0.5 seconds
++constexpr auto kHostFrameTimeout = std::chrono::seconds(3);
+ 
+ // Constants for tryLock during dumpstate
+ static constexpr int kDumpLockRetries = 50;
+@@ -114,14 +111,14 @@ ExternalCameraDeviceSession::ExternalCameraDeviceSession(
+         const std::shared_ptr<ICameraDeviceCallback>& callback, const ExternalCameraConfig& cfg,
+         const std::vector<SupportedV4L2Format>& sortedFormats, const CroppingType& croppingType,
+         const common::V1_0::helper::CameraMetadata& chars, const std::string& cameraId,
+-        unique_fd v4l2Fd)
++        std::shared_ptr<deckard::HostConnection> host)
+     : mCallback(callback),
+       mCfg(cfg),
+       mCameraCharacteristics(chars),
+       mSupportedFormats(sortedFormats),
+       mCroppingType(croppingType),
+       mCameraId(cameraId),
+-      mV4l2Fd(std::move(v4l2Fd)),
++      mHost(std::move(host)),
+       mMaxThumbResolution(getMaxThumbResolution()),
+       mMaxJpegResolution(getMaxJpegResolution()) {}
+ 
+@@ -140,38 +137,8 @@ Size ExternalCameraDeviceSession::getMaxJpegResolution() const {
+ }
+ 
+ bool ExternalCameraDeviceSession::initialize() {
+-    if (mV4l2Fd.get() < 0) {
+-        ALOGE("%s: invalid v4l2 device fd %d!", __FUNCTION__, mV4l2Fd.get());
+-        return true;
+-    }
+-
+-    struct v4l2_capability capability;
+-    int ret = ioctl(mV4l2Fd.get(), VIDIOC_QUERYCAP, &capability);
+-    std::string make, model;
+-    if (ret < 0) {
+-        ALOGW("%s v4l2 QUERYCAP failed", __FUNCTION__);
+-        mExifMake = "Generic UVC webcam";
+-        mExifModel = "Generic UVC webcam";
+-    } else {
+-        // capability.card is UTF-8 encoded
+-        char card[32];
+-        int j = 0;
+-        for (int i = 0; i < 32; i++) {
+-            if (capability.card[i] < 128) {
+-                card[j++] = capability.card[i];
+-            }
+-            if (capability.card[i] == '\0') {
+-                break;
+-            }
+-        }
+-        if (j == 0 || card[j - 1] != '\0') {
+-            mExifMake = "Generic UVC webcam";
+-            mExifModel = "Generic UVC webcam";
+-        } else {
+-            mExifMake = card;
+-            mExifModel = card;
+-        }
+-    }
++    mExifMake = base::GetProperty("ro.product.manufacturer", "Marathon");
++    mExifModel = base::GetProperty("ro.product.model", "Deckard");
+ 
+     initOutputThread();
+     if (mOutputThread == nullptr) {
+@@ -641,7 +608,7 @@ Status ExternalCameraDeviceSession::processOneCaptureRequest(const CaptureReques
+     }
+ 
+     nsecs_t shutterTs = 0;
+-    std::unique_ptr<V4L2Frame> frameIn = dequeueV4l2FrameLocked(&shutterTs);
++    std::unique_ptr<HostFrame> frameIn = dequeueV4l2FrameLocked(&shutterTs);
+     if (frameIn == nullptr) {
+         ALOGE("%s: V4L2 deque frame failed!", __FUNCTION__);
+         return Status::INTERNAL_ERROR;
+@@ -817,10 +784,9 @@ Status ExternalCameraDeviceSession::switchToOffline(
+         offlineReqs[i]->setting = v4lReq->setting;
+         offlineReqs[i]->shutterTs = v4lReq->shutterTs;
+         offlineReqs[i]->buffers = v4lReq->buffers;
+-        std::shared_ptr<V4L2Frame> v4l2Frame(static_cast<V4L2Frame*>(v4lReq->frameIn.get()));
+-        offlineReqs[i]->frameIn = std::make_shared<AllocatedV4L2Frame>(v4l2Frame);
++        std::shared_ptr<HostFrame> v4l2Frame = std::static_pointer_cast<HostFrame>(v4lReq->frameIn);
++        offlineReqs[i]->frameIn = std::make_shared<AllocatedHostFrame>(v4l2Frame);
+         i++;
+-        // enqueue V4L2 frame
+         enqueueV4l2Frame(v4l2Frame);
+     }
+ 
+@@ -1055,60 +1021,10 @@ int ExternalCameraDeviceSession::configureV4l2StreamLocked(const SupportedV4L2Fo
+     ATRACE_CALL();
+     int ret = v4l2StreamOffLocked();
+     if (ret != OK) {
+-        ALOGE("%s: stop v4l2 streaming failed: ret %d", __FUNCTION__, ret);
++        ALOGE("%s: stop host stream failed: ret %d", __FUNCTION__, ret);
+         return ret;
+     }
+ 
+-    // VIDIOC_S_FMT w/h/fmt
+-    v4l2_format fmt;
+-    fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+-    fmt.fmt.pix.width = v4l2Fmt.width;
+-    fmt.fmt.pix.height = v4l2Fmt.height;
+-    fmt.fmt.pix.pixelformat = v4l2Fmt.fourcc;
+-
+-    {
+-        int numAttempt = 0;
+-        do {
+-            ret = TEMP_FAILURE_RETRY(ioctl(mV4l2Fd.get(), VIDIOC_S_FMT, &fmt));
+-            if (numAttempt == MAX_RETRY) {
+-                break;
+-            }
+-            numAttempt++;
+-            if (ret < 0) {
+-                ALOGW("%s: VIDIOC_S_FMT failed, wait 33ms and try again", __FUNCTION__);
+-                usleep(IOCTL_RETRY_SLEEP_US);  // sleep and try again
+-            }
+-        } while (ret < 0);
+-        if (ret < 0) {
+-            ALOGE("%s: S_FMT ioctl failed: %s", __FUNCTION__, strerror(errno));
+-            return -errno;
+-        }
+-    }
+-
+-    if (v4l2Fmt.width != fmt.fmt.pix.width || v4l2Fmt.height != fmt.fmt.pix.height ||
+-        v4l2Fmt.fourcc != fmt.fmt.pix.pixelformat) {
+-        ALOGE("%s: S_FMT expect %c%c%c%c %dx%d, got %c%c%c%c %dx%d instead!", __FUNCTION__,
+-              v4l2Fmt.fourcc & 0xFF, (v4l2Fmt.fourcc >> 8) & 0xFF, (v4l2Fmt.fourcc >> 16) & 0xFF,
+-              (v4l2Fmt.fourcc >> 24) & 0xFF, v4l2Fmt.width, v4l2Fmt.height,
+-              fmt.fmt.pix.pixelformat & 0xFF, (fmt.fmt.pix.pixelformat >> 8) & 0xFF,
+-              (fmt.fmt.pix.pixelformat >> 16) & 0xFF, (fmt.fmt.pix.pixelformat >> 24) & 0xFF,
+-              fmt.fmt.pix.width, fmt.fmt.pix.height);
+-        return -EINVAL;
+-    }
+-
+-    uint32_t bufferSize = fmt.fmt.pix.sizeimage;
+-    ALOGI("%s: V4L2 buffer size is %d", __FUNCTION__, bufferSize);
+-    uint32_t expectedMaxBufferSize = kMaxBytesPerPixel * fmt.fmt.pix.width * fmt.fmt.pix.height;
+-    if (bufferSize == 0) {
+-        ALOGE("%s: Invalid V4L2 buffer size = 0", __FUNCTION__);
+-        return -EINVAL;
+-    } else if (bufferSize > expectedMaxBufferSize) {
+-        ALOGW("%s: V4L2 buffer size: %u, larger than maximum size: %u, clamping to %u",
+-              __FUNCTION__, bufferSize, expectedMaxBufferSize, expectedMaxBufferSize);
+-        bufferSize = expectedMaxBufferSize;
+-    }
+-    mMaxV4L2BufferSize = bufferSize;
+-
+     const double kDefaultFps = 30.0;
+     double fps = std::numeric_limits<double>::max();
+     if (requestFps != 0.0) {
+@@ -1131,101 +1047,27 @@ int ExternalCameraDeviceSession::configureV4l2StreamLocked(const SupportedV4L2Fo
+         }
+     }
+ 
+-    int fpsRet = setV4l2FpsLocked(fps);
+-    if (fpsRet != 0 && fpsRet != -EINVAL) {
+-        ALOGE("%s: set fps failed: %s", __FUNCTION__, strerror(fpsRet));
+-        return fpsRet;
++    deckard::HostError err = mHost->start(v4l2Fmt.width, v4l2Fmt.height, std::lround(fps));
++    if (err != deckard::HostError::NONE) {
++        ALOGE("%s: host stream %dx%d@%f failed: %d", __FUNCTION__, v4l2Fmt.width,
++              v4l2Fmt.height, fps, static_cast<int>(err));
++        return -EIO;
+     }
+ 
+-    uint32_t v4lBufferCount = (fps >= kDefaultFps) ? mCfg.numVideoBuffers : mCfg.numStillBuffers;
+-
+     // Double the max lag in theory.
+-    mMaxLagNs = v4lBufferCount * 1000000000LL * 2 / fps;
+-    ALOGI("%s: set mMaxLagNs to %" PRIu64 " ns, v4lBufferCount %u", __FUNCTION__, mMaxLagNs,
+-          v4lBufferCount);
+-
+-    // VIDIOC_REQBUFS: create buffers
+-    v4l2_requestbuffers req_buffers{};
+-    req_buffers.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+-    req_buffers.memory = V4L2_MEMORY_MMAP;
+-    req_buffers.count = v4lBufferCount;
+-    if (TEMP_FAILURE_RETRY(ioctl(mV4l2Fd.get(), VIDIOC_REQBUFS, &req_buffers)) < 0) {
+-        ALOGE("%s: VIDIOC_REQBUFS failed: %s", __FUNCTION__, strerror(errno));
+-        return -errno;
+-    }
+-
+-    // Driver can indeed return more buffer if it needs more to operate
+-    if (req_buffers.count < v4lBufferCount) {
+-        ALOGE("%s: VIDIOC_REQBUFS expected %d buffers, got %d instead", __FUNCTION__,
+-              v4lBufferCount, req_buffers.count);
+-        return NO_MEMORY;
+-    }
+-
+-    // VIDIOC_QUERYBUF:  get buffer offset in the V4L2 fd
+-    // VIDIOC_QBUF: send buffer to driver
+-    mV4L2BufferCount = req_buffers.count;
+-    for (uint32_t i = 0; i < req_buffers.count; i++) {
+-        v4l2_buffer buffer = {
+-                .index = i, .type = V4L2_BUF_TYPE_VIDEO_CAPTURE, .memory = V4L2_MEMORY_MMAP};
+-
+-        if (TEMP_FAILURE_RETRY(ioctl(mV4l2Fd.get(), VIDIOC_QUERYBUF, &buffer)) < 0) {
+-            ALOGE("%s: QUERYBUF %d failed: %s", __FUNCTION__, i, strerror(errno));
+-            return -errno;
+-        }
+-
+-        if (TEMP_FAILURE_RETRY(ioctl(mV4l2Fd.get(), VIDIOC_QBUF, &buffer)) < 0) {
+-            ALOGE("%s: QBUF %d failed: %s", __FUNCTION__, i, strerror(errno));
+-            return -errno;
+-        }
+-    }
+-
+-    {
+-        // VIDIOC_STREAMON: start streaming
+-        v4l2_buf_type capture_type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+-        int numAttempt = 0;
+-        do {
+-            ret = TEMP_FAILURE_RETRY(ioctl(mV4l2Fd.get(), VIDIOC_STREAMON, &capture_type));
+-            if (numAttempt == MAX_RETRY) {
+-                break;
+-            }
+-            numAttempt++;
+-            if (ret < 0) {
+-                ALOGW("%s: VIDIOC_STREAMON failed, wait 33ms and try again", __FUNCTION__);
+-                usleep(IOCTL_RETRY_SLEEP_US);  // sleep 100 ms and try again
+-            }
+-        } while (ret < 0);
+-
+-        if (ret < 0) {
+-            ALOGE("%s: VIDIOC_STREAMON ioctl failed: %s", __FUNCTION__, strerror(errno));
+-            return -errno;
+-        }
+-    }
+-
+-    // Swallow first few frames after streamOn to account for bad frames from some devices
+-    for (int i = 0; i < kBadFramesAfterStreamOn; i++) {
+-        v4l2_buffer buffer{};
+-        buffer.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+-        buffer.memory = V4L2_MEMORY_MMAP;
+-        if (TEMP_FAILURE_RETRY(ioctl(mV4l2Fd.get(), VIDIOC_DQBUF, &buffer)) < 0) {
+-            ALOGE("%s: DQBUF fails: %s", __FUNCTION__, strerror(errno));
+-            return -errno;
+-        }
+-
+-        if (TEMP_FAILURE_RETRY(ioctl(mV4l2Fd.get(), VIDIOC_QBUF, &buffer)) < 0) {
+-            ALOGE("%s: QBUF index %d fails: %s", __FUNCTION__, buffer.index, strerror(errno));
+-            return -errno;
+-        }
+-    }
++    mMaxLagNs = deckard::kHostFrames * 1000000000LL * 2 / fps;
++    mV4L2BufferCount = deckard::kHostFrames;
+ 
+-    ALOGI("%s: start V4L2 streaming %dx%d@%ffps", __FUNCTION__, v4l2Fmt.width, v4l2Fmt.height, fps);
++    ALOGI("%s: start host stream %dx%d@%ffps", __FUNCTION__, v4l2Fmt.width, v4l2Fmt.height, fps);
+     mV4l2StreamingFmt = v4l2Fmt;
++    mV4l2StreamingFps = fps;
+     mV4l2Streaming = true;
+     return OK;
+ }
+ 
+-std::unique_ptr<V4L2Frame> ExternalCameraDeviceSession::dequeueV4l2FrameLocked(nsecs_t* shutterTs) {
++std::unique_ptr<HostFrame> ExternalCameraDeviceSession::dequeueV4l2FrameLocked(nsecs_t* shutterTs) {
+     ATRACE_CALL();
+-    std::unique_ptr<V4L2Frame> ret = nullptr;
++    std::unique_ptr<HostFrame> ret = nullptr;
+     if (shutterTs == nullptr) {
+         ALOGE("%s: shutterTs must not be null!", __FUNCTION__);
+         return ret;
+@@ -1241,92 +1083,44 @@ std::unique_ptr<V4L2Frame> ExternalCameraDeviceSession::dequeueV4l2FrameLocked(n
+         }
+     }
+ 
+-    uint64_t lagNs = 0;
+-    v4l2_buffer buffer{};
+-    do {
+-        ATRACE_BEGIN("VIDIOC_DQBUF");
+-        buffer.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+-        buffer.memory = V4L2_MEMORY_MMAP;
+-        if (TEMP_FAILURE_RETRY(ioctl(mV4l2Fd.get(), VIDIOC_DQBUF, &buffer)) < 0) {
+-            ALOGE("%s: DQBUF fails: %s", __FUNCTION__, strerror(errno));
+-            return ret;
+-        }
++    while (true) {
++        ATRACE_BEGIN("host frame");
++        std::optional<deckard::HostFrameData> frame = mHost->nextFrame(kHostFrameTimeout);
+         ATRACE_END();
+-
+-        if (buffer.index >= mV4L2BufferCount) {
+-            ALOGE("%s: Invalid buffer id: %d", __FUNCTION__, buffer.index);
+-            return ret;
+-        }
+-
+-        if (buffer.flags & V4L2_BUF_FLAG_ERROR) {
+-            ALOGE("%s: v4l2 buf error! buf flag 0x%x", __FUNCTION__, buffer.flags);
+-            // TODO: try to dequeue again
+-        }
+-
+-        if (buffer.bytesused > mMaxV4L2BufferSize) {
+-            ALOGE("%s: v4l2 buffer bytes used: %u maximum %u", __FUNCTION__, buffer.bytesused,
+-                  mMaxV4L2BufferSize);
++        if (!frame.has_value()) {
++            ALOGE("%s: no frame from the host", __FUNCTION__);
+             return ret;
+         }
+-
+-        nsecs_t curTimeNs = systemTime(SYSTEM_TIME_MONOTONIC);
+-
+-        if (buffer.flags & V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC) {
+-            // Ideally we should also check for V4L2_BUF_FLAG_TSTAMP_SRC_SOE, but
+-            // even V4L2_BUF_FLAG_TSTAMP_SRC_EOF is better than capture a timestamp now
+-            *shutterTs = static_cast<nsecs_t>(buffer.timestamp.tv_sec) * 1000000000LL +
+-                         buffer.timestamp.tv_usec * 1000LL;
+-        } else {
+-            *shutterTs = curTimeNs;
+-        }
+-
+-        // The tactic only takes effect on v4l2 buffers with flag V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC.
+-        // Most USB cameras should have the feature.
+-        if (curTimeNs < *shutterTs) {
+-            lagNs = 0;
+-            ALOGW("%s: should not happen, the monotonic clock has issue, shutterTs is in the "
+-                  "future, curTimeNs %" PRId64 "  < "
+-                  "shutterTs %" PRId64 "",
+-                  __func__, curTimeNs, *shutterTs);
+-        } else {
+-            lagNs = curTimeNs - *shutterTs;
++        if (frame->width != static_cast<uint32_t>(mV4l2StreamingFmt.width) ||
++            frame->height != static_cast<uint32_t>(mV4l2StreamingFmt.height)) {
++            ALOGE("%s: host frame is %ux%u, not %dx%d", __FUNCTION__, frame->width, frame->height,
++                  mV4l2StreamingFmt.width, mV4l2StreamingFmt.height);
++            mHost->release(frame->id);
++            continue;
+         }
+-
++        nsecs_t now = systemTime(SYSTEM_TIME_MONOTONIC);
++        uint64_t lagNs = now > frame->timestamp ? now - frame->timestamp : 0;
+         if (lagNs > mMaxLagNs) {
+-            ALOGI("%s: drop too old buffer, index %d, lag %" PRIu64 " ns > max %" PRIu64 " ns", __FUNCTION__,
+-                  buffer.index, lagNs, mMaxLagNs);
+-            int retVal = ioctl(mV4l2Fd.get(), VIDIOC_QBUF, &buffer);
+-            if (retVal) {
+-                ALOGE("%s: unexpected VIDIOC_QBUF failed, retVal %d", __FUNCTION__, retVal);
+-                return ret;
+-            }
++            ALOGI("%s: drop too old frame %" PRIu64 ", lag %" PRIu64 " ns > max %" PRIu64 " ns",
++                  __FUNCTION__, frame->id, lagNs, mMaxLagNs);
++            mHost->release(frame->id);
++            continue;
+         }
+-    } while (lagNs > mMaxLagNs);
++        *shutterTs = frame->timestamp;
++        ret = std::make_unique<HostFrame>(std::move(*frame), mHost);
++        break;
++    }
+ 
+     {
+         std::lock_guard<std::mutex> lk(mV4l2BufferLock);
+         mNumDequeuedV4l2Buffers++;
+     }
+-
+-    return std::make_unique<V4L2Frame>(mV4l2StreamingFmt.width, mV4l2StreamingFmt.height,
+-                                       mV4l2StreamingFmt.fourcc, buffer.index, mV4l2Fd.get(),
+-                                       buffer.bytesused, buffer.m.offset);
++    return ret;
+ }
+ 
+-void ExternalCameraDeviceSession::enqueueV4l2Frame(const std::shared_ptr<V4L2Frame>& frame) {
++void ExternalCameraDeviceSession::enqueueV4l2Frame(const std::shared_ptr<HostFrame>& frame) {
+     ATRACE_CALL();
+-    frame->unmap();
+-    ATRACE_BEGIN("VIDIOC_QBUF");
+-    v4l2_buffer buffer{};
+-    buffer.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+-    buffer.memory = V4L2_MEMORY_MMAP;
+-    buffer.index = frame->mBufferIndex;
+-    if (TEMP_FAILURE_RETRY(ioctl(mV4l2Fd.get(), VIDIOC_QBUF, &buffer)) < 0) {
+-        ALOGE("%s: QBUF index %d fails: %s", __FUNCTION__, frame->mBufferIndex, strerror(errno));
+-        return;
+-    }
+-    ATRACE_END();
+-
++    frame->release();
+     {
+         std::lock_guard<std::mutex> lk(mV4l2BufferLock);
+         mNumDequeuedV4l2Buffers--;
+@@ -1427,8 +1221,7 @@ void ExternalCameraDeviceSession::closeImpl() {
+             }
+         }
+         v4l2StreamOffLocked();
+-        ALOGV("%s: closing V4L2 camera FD %d", __FUNCTION__, mV4l2Fd.get());
+-        mV4l2Fd.reset();
++        mHost.reset();
+         mClosed = true;
+     }
+ }
+@@ -1452,70 +1245,21 @@ int ExternalCameraDeviceSession::v4l2StreamOffLocked() {
+     {
+         std::lock_guard<std::mutex> lk(mV4l2BufferLock);
+         if (mNumDequeuedV4l2Buffers != 0) {
+-            ALOGE("%s: there are %zu inflight V4L buffers", __FUNCTION__, mNumDequeuedV4l2Buffers);
++            ALOGE("%s: there are %zu inflight host frames", __FUNCTION__, mNumDequeuedV4l2Buffers);
+             return -1;
+         }
+     }
+     mV4L2BufferCount = 0;
+ 
+-    // VIDIOC_STREAMOFF
+-    v4l2_buf_type capture_type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+-    if (TEMP_FAILURE_RETRY(ioctl(mV4l2Fd.get(), VIDIOC_STREAMOFF, &capture_type)) < 0) {
+-        ALOGE("%s: STREAMOFF failed: %s", __FUNCTION__, strerror(errno));
+-        return -errno;
+-    }
+-
+-    // VIDIOC_REQBUFS: clear buffers
+-    v4l2_requestbuffers req_buffers{};
+-    req_buffers.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+-    req_buffers.memory = V4L2_MEMORY_MMAP;
+-    req_buffers.count = 0;
+-    if (TEMP_FAILURE_RETRY(ioctl(mV4l2Fd.get(), VIDIOC_REQBUFS, &req_buffers)) < 0) {
+-        ALOGE("%s: REQBUFS failed: %s", __FUNCTION__, strerror(errno));
+-        return -errno;
++    if (mHost->stop() != deckard::HostError::NONE) {
++        ALOGE("%s: stopping the host stream failed", __FUNCTION__);
++        return -EIO;
+     }
+ 
+     mV4l2Streaming = false;
+     return OK;
+ }
+ 
+-int ExternalCameraDeviceSession::setV4l2FpsLocked(double fps) {
+-    // VIDIOC_G_PARM/VIDIOC_S_PARM: set fps
+-    v4l2_streamparm streamparm = {.type = V4L2_BUF_TYPE_VIDEO_CAPTURE};
+-    // The following line checks that the driver knows about framerate get/set.
+-    int ret = TEMP_FAILURE_RETRY(ioctl(mV4l2Fd.get(), VIDIOC_G_PARM, &streamparm));
+-    if (ret != 0) {
+-        if (errno == -EINVAL) {
+-            ALOGW("%s: device does not support VIDIOC_G_PARM", __FUNCTION__);
+-        }
+-        return -errno;
+-    }
+-    // Now check if the device is able to accept a capture framerate set.
+-    if (!(streamparm.parm.capture.capability & V4L2_CAP_TIMEPERFRAME)) {
+-        ALOGW("%s: device does not support V4L2_CAP_TIMEPERFRAME", __FUNCTION__);
+-        return -EINVAL;
+-    }
+-
+-    // fps is float, approximate by a fraction.
+-    const int kFrameRatePrecision = 10000;
+-    streamparm.parm.capture.timeperframe.numerator = kFrameRatePrecision;
+-    streamparm.parm.capture.timeperframe.denominator = (fps * kFrameRatePrecision);
+-
+-    if (TEMP_FAILURE_RETRY(ioctl(mV4l2Fd.get(), VIDIOC_S_PARM, &streamparm)) < 0) {
+-        ALOGE("%s: failed to set framerate to %f: %s", __FUNCTION__, fps, strerror(errno));
+-        return -1;
+-    }
+-
+-    double retFps = streamparm.parm.capture.timeperframe.denominator /
+-                    static_cast<double>(streamparm.parm.capture.timeperframe.numerator);
+-    if (std::fabs(fps - retFps) > 1.0) {
+-        ALOGE("%s: expect fps %f, got %f instead", __FUNCTION__, fps, retFps);
+-        return -1;
+-    }
+-    mV4l2StreamingFps = fps;
+-    return 0;
+-}
+-
+ void ExternalCameraDeviceSession::cleanupInflightFences(std::vector<int>& allFences,
+                                                         size_t numFences) {
+     for (size_t j = 0; j < numFences; j++) {
+@@ -1732,7 +1476,7 @@ Status ExternalCameraDeviceSession::processCaptureRequestError(
+         std::vector<CaptureResult>* outResults) {
+     ATRACE_CALL();
+     // Return V4L2 buffer to V4L2 buffer queue
+-    std::shared_ptr<V4L2Frame> v4l2Frame = std::static_pointer_cast<V4L2Frame>(req->frameIn);
++    std::shared_ptr<HostFrame> v4l2Frame = std::static_pointer_cast<HostFrame>(req->frameIn);
+     enqueueV4l2Frame(v4l2Frame);
+ 
+     if (outMsgs == nullptr) {
+@@ -1790,7 +1534,7 @@ Status ExternalCameraDeviceSession::processCaptureRequestError(
+ Status ExternalCameraDeviceSession::processCaptureResult(std::shared_ptr<HalRequest>& req) {
+     ATRACE_CALL();
+     // Return V4L2 buffer to V4L2 buffer queue
+-    std::shared_ptr<V4L2Frame> v4l2Frame = std::static_pointer_cast<V4L2Frame>(req->frameIn);
++    std::shared_ptr<HostFrame> v4l2Frame = std::static_pointer_cast<HostFrame>(req->frameIn);
+     enqueueV4l2Frame(v4l2Frame);
+ 
+     // NotifyShutter
+@@ -1922,8 +1666,8 @@ binder_status_t ExternalCameraDeviceSession::dump(int fd, const char** /*args*/,
+         }
+     }
+ 
+-    dprintf(fd, "External camera %s V4L2 FD %d, cropping type %s, %s\n", mCameraId.c_str(),
+-            mV4l2Fd.get(), (mCroppingType == VERTICAL) ? "vertical" : "horizontal",
++    dprintf(fd, "Deckard camera %s, cropping type %s, %s\n", mCameraId.c_str(),
++            (mCroppingType == VERTICAL) ? "vertical" : "horizontal",
+             streaming ? "streaming" : "not streaming");
+ 
+     if (streaming) {
+@@ -2778,8 +2522,8 @@ bool ExternalCameraDeviceSession::OutputThread::threadLoop() {
+         return false;
+     };
+ 
+-    if (req->frameIn->mFourcc != V4L2_PIX_FMT_MJPEG && req->frameIn->mFourcc != V4L2_PIX_FMT_Z16) {
+-        return onDeviceError("%s: do not support V4L2 format %c%c%c%c", __FUNCTION__,
++    if (req->frameIn->mFourcc != deckard::kHostFourcc) {
++        return onDeviceError("%s: do not support host format %c%c%c%c", __FUNCTION__,
+                              req->frameIn->mFourcc & 0xFF, (req->frameIn->mFourcc >> 8) & 0xFF,
+                              (req->frameIn->mFourcc >> 16) & 0xFF,
+                              (req->frameIn->mFourcc >> 24) & 0xFF);
+@@ -2792,13 +2536,12 @@ bool ExternalCameraDeviceSession::OutputThread::threadLoop() {
+     }
+ 
+     std::unique_lock<std::mutex> lk(mBufferLock);
+-    // Convert input V4L2 frame to YU12 of the same size
+-    // TODO: see if we can save some computation by converting to YV12 here
++    // Convert the host frame to YU12 of the same size
+     uint8_t* inData;
+     size_t inDataSize;
+     if (req->frameIn->getData(&inData, &inDataSize) != 0) {
+         lk.unlock();
+-        return onDeviceError("%s: V4L2 buffer map failed", __FUNCTION__);
++        return onDeviceError("%s: host frame map failed", __FUNCTION__);
+     }
+ 
+     // Process camera mute state
+@@ -2825,9 +2568,8 @@ bool ExternalCameraDeviceSession::OutputThread::threadLoop() {
+         }
+     }
+ 
+-    // TODO: in some special case maybe we can decode jpg directly to gralloc output?
+-    if (req->frameIn->mFourcc == V4L2_PIX_FMT_MJPEG) {
+-        ATRACE_BEGIN("MJPGtoI420");
++    {
++        ATRACE_BEGIN("ABGRToJ420");
+         res = 0;
+         if (mCameraMuted) {
+             res = libyuv::ConvertToI420(
+@@ -2838,18 +2580,17 @@ bool ExternalCameraDeviceSession::OutputThread::threadLoop() {
+                     mYu12Frame->mWidth, mYu12Frame->mHeight, mYu12Frame->mWidth,
+                     mYu12Frame->mHeight, libyuv::kRotate0, libyuv::FOURCC_RAW);
+         } else {
+-            res = libyuv::MJPGToI420(
+-                    inData, inDataSize, static_cast<uint8_t*>(mYu12FrameLayout.y),
+-                    mYu12FrameLayout.yStride, static_cast<uint8_t*>(mYu12FrameLayout.cb),
+-                    mYu12FrameLayout.cStride, static_cast<uint8_t*>(mYu12FrameLayout.cr),
+-                    mYu12FrameLayout.cStride, mYu12Frame->mWidth, mYu12Frame->mHeight,
++            res = libyuv::ABGRToJ420(
++                    inData, inDataSize / mYu12Frame->mHeight,
++                    static_cast<uint8_t*>(mYu12FrameLayout.y), mYu12FrameLayout.yStride,
++                    static_cast<uint8_t*>(mYu12FrameLayout.cb), mYu12FrameLayout.cStride,
++                    static_cast<uint8_t*>(mYu12FrameLayout.cr), mYu12FrameLayout.cStride,
+                     mYu12Frame->mWidth, mYu12Frame->mHeight);
+         }
+         ATRACE_END();
+ 
+         if (res != 0) {
+-            // For some webcam, the first few V4L2 frames might be malformed...
+-            ALOGE("%s: Convert V4L2 frame to YU12 failed! res %d", __FUNCTION__, res);
++            ALOGE("%s: Convert host frame to YU12 failed! res %d", __FUNCTION__, res);
+ 
+             ATRACE_BEGIN("Wait for BufferRequest done");
+             res = waitForBufferRequestDone(&req->buffers);
+diff --git a/camera/ExternalCameraDeviceSession.h b/camera/ExternalCameraDeviceSession.h
+index 7fee1a4..107426d 100644
+--- a/camera/ExternalCameraDeviceSession.h
++++ b/camera/ExternalCameraDeviceSession.h
+@@ -68,7 +68,8 @@ class ExternalCameraDeviceSession : public BnCameraDeviceSession, public OutputT
+                                 const std::vector<SupportedV4L2Format>& sortedFormats,
+                                 const CroppingType& croppingType,
+                                 const common::V1_0::helper::CameraMetadata& chars,
+-                                const std::string& cameraId, unique_fd v4l2Fd);
++                                const std::string& cameraId,
++                                std::shared_ptr<deckard::HostConnection> host);
+     ~ExternalCameraDeviceSession() override;
+ 
+     // Caller must use this method to check if CameraDeviceSession ctor failed
+@@ -122,7 +123,6 @@ class ExternalCameraDeviceSession : public BnCameraDeviceSession, public OutputT
+ 
+     static const int kMaxProcessedStream = 2;
+     static const int kMaxStallStream = 1;
+-    static const uint32_t kMaxBytesPerPixel = 3;
+ 
+     class BufferRequestThread : public SimpleThread {
+       public:
+@@ -254,12 +254,10 @@ class ExternalCameraDeviceSession : public BnCameraDeviceSession, public OutputT
+     int configureV4l2StreamLocked(const SupportedV4L2Format& fmt, double fps = 0.0);
+     int v4l2StreamOffLocked();
+ 
+-    int setV4l2FpsLocked(double fps);
+-
+-    std::unique_ptr<V4L2Frame> dequeueV4l2FrameLocked(
++    std::unique_ptr<HostFrame> dequeueV4l2FrameLocked(
+             /*out*/ nsecs_t* shutterTs);  // Called with mLock held
+ 
+-    void enqueueV4l2Frame(const std::shared_ptr<V4L2Frame>&);
++    void enqueueV4l2Frame(const std::shared_ptr<HostFrame>&);
+ 
+     // Check if input Stream is one of supported stream setting on this device
+     static bool isSupported(const Stream& stream,
+@@ -316,7 +314,7 @@ class ExternalCameraDeviceSession : public BnCameraDeviceSession, public OutputT
+ 
+     // Not protected by mLock, this is almost a const.
+     // Setup in constructor, reset in close() after OutputThread is joined
+-    unique_fd mV4l2Fd;
++    std::shared_ptr<deckard::HostConnection> mHost;
+ 
+     // device is closed either
+     //    - closed by user
+@@ -337,7 +335,6 @@ class ExternalCameraDeviceSession : public BnCameraDeviceSession, public OutputT
+     std::mutex mV4l2BufferLock;                  // protect the buffer count and condition below
+     std::condition_variable mV4L2BufferReturned;
+     size_t mNumDequeuedV4l2Buffers = 0;
+-    uint32_t mMaxV4L2BufferSize = 0;
+ 
+     // Not protected by mLock (but might be used when mLock is locked)
+     std::shared_ptr<OutputThread> mOutputThread;
+diff --git a/camera/ExternalCameraOfflineSession.cpp b/camera/ExternalCameraOfflineSession.cpp
+index 2d4e2e0..3063323 100644
+--- a/camera/ExternalCameraOfflineSession.cpp
++++ b/camera/ExternalCameraOfflineSession.cpp
+@@ -389,8 +389,8 @@ bool ExternalCameraOfflineSession::OutputThread::threadLoop() {
+         return false;
+     };
+ 
+-    if (req->frameIn->mFourcc != V4L2_PIX_FMT_MJPEG && req->frameIn->mFourcc != V4L2_PIX_FMT_Z16) {
+-        return onDeviceError("%s: do not support V4L2 format %c%c%c%c", __FUNCTION__,
++    if (req->frameIn->mFourcc != deckard::kHostFourcc) {
++        return onDeviceError("%s: do not support host format %c%c%c%c", __FUNCTION__,
+                              req->frameIn->mFourcc & 0xFF, (req->frameIn->mFourcc >> 8) & 0xFF,
+                              (req->frameIn->mFourcc >> 16) & 0xFF,
+                              (req->frameIn->mFourcc >> 24) & 0xFF);
+@@ -403,29 +403,26 @@ bool ExternalCameraOfflineSession::OutputThread::threadLoop() {
+     }
+ 
+     std::unique_lock<std::mutex> lk(mBufferLock);
+-    // Convert input V4L2 frame to YU12 of the same size
+-    // TODO: see if we can save some computation by converting to YV12 here
++    // Convert the host frame to YU12 of the same size
+     uint8_t* inData;
+     size_t inDataSize;
+     if (req->frameIn->getData(&inData, &inDataSize) != 0) {
+         lk.unlock();
+-        return onDeviceError("%s: V4L2 buffer map failed", __FUNCTION__);
++        return onDeviceError("%s: host frame map failed", __FUNCTION__);
+     }
+ 
+-    // TODO: in some special case maybe we can decode jpg directly to gralloc output?
+-    if (req->frameIn->mFourcc == V4L2_PIX_FMT_MJPEG) {
+-        ATRACE_BEGIN("MJPGtoI420");
+-        int convRes = libyuv::MJPGToI420(
+-                inData, inDataSize, static_cast<uint8_t*>(mYu12FrameLayout.y),
+-                mYu12FrameLayout.yStride, static_cast<uint8_t*>(mYu12FrameLayout.cb),
+-                mYu12FrameLayout.cStride, static_cast<uint8_t*>(mYu12FrameLayout.cr),
+-                mYu12FrameLayout.cStride, mYu12Frame->mWidth, mYu12Frame->mHeight,
++    {
++        ATRACE_BEGIN("ABGRToJ420");
++        int convRes = libyuv::ABGRToJ420(
++                inData, inDataSize / mYu12Frame->mHeight,
++                static_cast<uint8_t*>(mYu12FrameLayout.y), mYu12FrameLayout.yStride,
++                static_cast<uint8_t*>(mYu12FrameLayout.cb), mYu12FrameLayout.cStride,
++                static_cast<uint8_t*>(mYu12FrameLayout.cr), mYu12FrameLayout.cStride,
+                 mYu12Frame->mWidth, mYu12Frame->mHeight);
+         ATRACE_END();
+ 
+         if (convRes != 0) {
+-            // For some webcam, the first few V4L2 frames might be malformed...
+-            ALOGE("%s: Convert V4L2 frame to YU12 failed! res %d", __FUNCTION__, convRes);
++            ALOGE("%s: Convert host frame to YU12 failed! res %d", __FUNCTION__, convRes);
+             lk.unlock();
+             Status st = parent->processCaptureRequestError(req);
+             if (st != Status::OK) {
+diff --git a/camera/ExternalCameraProvider.cpp b/camera/ExternalCameraProvider.cpp
+index 54875ab..29437cf 100644
+--- a/camera/ExternalCameraProvider.cpp
++++ b/camera/ExternalCameraProvider.cpp
+@@ -14,7 +14,7 @@
+  * limitations under the License.
+  */
+ 
+-#define LOG_TAG "ExtCamPrvdr"
++#define LOG_TAG "DeckardCamPrvdr"
+ // #define LOG_NDEBUG 0
+ 
+ #include "ExternalCameraProvider.h"
+@@ -23,9 +23,7 @@
+ #include <aidl/android/hardware/camera/common/Status.h>
+ #include <convert.h>
+ #include <cutils/properties.h>
+-#include <linux/videodev2.h>
+ #include <log/log.h>
+-#include <sys/inotify.h>
+ #include <regex>
+ 
+ namespace android {
+@@ -39,38 +37,22 @@ using ::android::hardware::camera::device::implementation::ExternalCameraDevice;
+ using ::android::hardware::camera::device::implementation::fromStatus;
+ using ::android::hardware::camera::external::common::ExternalCameraConfig;
+ 
+-namespace {
+-// "device@<version>/external/<id>"
+-const std::regex kDeviceNameRE("device@([0-9]+\\.[0-9]+)/external/(.+)");
+-const int kMaxDevicePathLen = 256;
+-constexpr char kDevicePath[] = "/dev/";
+-constexpr char kPrefix[] = "video";
+-constexpr int kPrefixLen = sizeof(kPrefix) - 1;
+-constexpr int kDevicePrefixLen = sizeof(kDevicePath) + kPrefixLen - 1;
++using ::android::hardware::camera::deckard::HostCameraInfo;
++using ::android::hardware::camera::deckard::HostConnection;
+ 
+-bool matchDeviceName(int cameraIdOffset, const std::string& deviceName, std::string* deviceVersion,
+-                     std::string* cameraDevicePath) {
+-    std::smatch sm;
+-    if (std::regex_match(deviceName, sm, kDeviceNameRE)) {
+-        if (deviceVersion != nullptr) {
+-            *deviceVersion = sm[1];
+-        }
+-        if (cameraDevicePath != nullptr) {
+-            *cameraDevicePath = "/dev/video" + std::to_string(std::stoi(sm[2]) - cameraIdOffset);
+-        }
+-        return true;
+-    }
+-    return false;
+-}
++namespace {
++// "device@<version>/internal/<id>"
++const std::regex kDeviceNameRE("device@([0-9]+\\.[0-9]+)/internal/(.+)");
++constexpr auto kReconnectDelay = std::chrono::seconds(2);
+ }  // namespace
+ 
+ ExternalCameraProvider::ExternalCameraProvider() : mCfg(ExternalCameraConfig::loadFromCfg()) {
+-    mHotPlugThread = std::make_shared<HotplugThread>(this);
+-    mHotPlugThread->run();
++    mHostWatchThread = std::make_shared<HostWatchThread>(this);
++    mHostWatchThread->run();
+ }
+ 
+ ExternalCameraProvider::~ExternalCameraProvider() {
+-    mHotPlugThread->requestExitAndWait();
++    mHostWatchThread->requestExitAndWait();
+ }
+ 
+ ndk::ScopedAStatus ExternalCameraProvider::setCallback(
+@@ -79,13 +61,14 @@ ndk::ScopedAStatus ExternalCameraProvider::setCallback(
+         return fromStatus(Status::ILLEGAL_ARGUMENT);
+     }
+ 
++    std::unordered_map<std::string, CameraDeviceStatus> statuses;
+     {
+         Mutex::Autolock _l(mLock);
+         mCallback = in_callback;
++        statuses = mCameraStatusMap;
+     }
+-
+-    for (const auto& pair : mCameraStatusMap) {
+-        mCallback->cameraDeviceStatusChange(pair.first, pair.second);
++    for (const auto& pair : statuses) {
++        in_callback->cameraDeviceStatusChange(pair.first, pair.second);
+     }
+     return fromStatus(Status::OK);
+ }
+@@ -95,7 +78,6 @@ ndk::ScopedAStatus ExternalCameraProvider::getVendorTags(
+     if (_aidl_return == nullptr) {
+         return fromStatus(Status::ILLEGAL_ARGUMENT);
+     }
+-    // No vendor tag support for USB camera
+     *_aidl_return = {};
+     return fromStatus(Status::OK);
+ }
+@@ -104,9 +86,13 @@ ndk::ScopedAStatus ExternalCameraProvider::getCameraIdList(std::vector<std::stri
+     if (_aidl_return == nullptr) {
+         return fromStatus(Status::ILLEGAL_ARGUMENT);
+     }
+-    // External camera HAL always report 0 camera, and extra cameras
+-    // are just reported via cameraDeviceStatusChange callbacks
+-    *_aidl_return = {};
++    Mutex::Autolock _l(mLock);
++    _aidl_return->clear();
++    for (const auto& pair : mCameraStatusMap) {
++        if (pair.second == CameraDeviceStatus::PRESENT) {
++            _aidl_return->push_back(pair.first);
++        }
++    }
+     return fromStatus(Status::OK);
+ }
+ 
+@@ -115,26 +101,24 @@ ndk::ScopedAStatus ExternalCameraProvider::getCameraDeviceInterface(
+     if (_aidl_return == nullptr) {
+         return fromStatus(Status::ILLEGAL_ARGUMENT);
+     }
+-    std::string cameraDevicePath, deviceVersion;
+-    bool match = matchDeviceName(mCfg.cameraIdOffset, in_cameraDeviceName, &deviceVersion,
+-                                 &cameraDevicePath);
+-
+-    if (!match) {
++    std::smatch sm;
++    if (!std::regex_match(in_cameraDeviceName, sm, kDeviceNameRE)) {
+         *_aidl_return = nullptr;
+         return fromStatus(Status::ILLEGAL_ARGUMENT);
+     }
+ 
+-    if (mCameraStatusMap.count(in_cameraDeviceName) == 0 ||
+-        mCameraStatusMap[in_cameraDeviceName] != CameraDeviceStatus::PRESENT) {
++    Mutex::Autolock _l(mLock);
++    auto camera = mCameras.find(in_cameraDeviceName);
++    if (camera == mCameras.end() || mCameraStatusMap[in_cameraDeviceName] !=
++                                            CameraDeviceStatus::PRESENT) {
+         *_aidl_return = nullptr;
+         return fromStatus(Status::ILLEGAL_ARGUMENT);
+     }
+ 
+-    ALOGV("Constructing external camera device");
+     std::shared_ptr<ExternalCameraDevice> deviceImpl =
+-            ndk::SharedRefBase::make<ExternalCameraDevice>(cameraDevicePath, mCfg);
++            ndk::SharedRefBase::make<ExternalCameraDevice>(camera->second, sm[2], mCfg);
+     if (deviceImpl == nullptr || deviceImpl->isInitFailed()) {
+-        ALOGE("%s: camera device %s init failed!", __FUNCTION__, cameraDevicePath.c_str());
++        ALOGE("%s: camera device %s init failed!", __FUNCTION__, in_cameraDeviceName.c_str());
+         *_aidl_return = nullptr;
+         return fromStatus(Status::INTERNAL_ERROR);
+     }
+@@ -172,209 +156,77 @@ ndk::ScopedAStatus ExternalCameraProvider::isConcurrentStreamCombinationSupporte
+     return fromStatus(Status::OK);
+ }
+ 
+-void ExternalCameraProvider::addExternalCamera(const char* devName) {
+-    ALOGV("%s: ExtCam: adding %s to External Camera HAL!", __FUNCTION__, devName);
+-    Mutex::Autolock _l(mLock);
+-    std::string deviceName;
+-    std::string cameraId =
+-            std::to_string(mCfg.cameraIdOffset + std::atoi(devName + kDevicePrefixLen));
+-    deviceName =
+-            std::string("device@") + ExternalCameraDevice::kDeviceVersion + "/external/" + cameraId;
+-    mCameraStatusMap[deviceName] = CameraDeviceStatus::PRESENT;
+-    if (mCallback != nullptr) {
+-        mCallback->cameraDeviceStatusChange(deviceName, CameraDeviceStatus::PRESENT);
+-    }
+-}
+-
+-void ExternalCameraProvider::deviceAdded(const char* devName) {
++void ExternalCameraProvider::setPresent(std::shared_ptr<HostConnection> host) {
++    std::vector<std::string> present;
++    std::shared_ptr<ICameraProviderCallback> callback;
+     {
+-        base::unique_fd fd(::open(devName, O_RDWR));
+-        if (fd.get() < 0) {
+-            ALOGE("%s open v4l2 device %s failed:%s", __FUNCTION__, devName, strerror(errno));
+-            return;
+-        }
+-
+-        struct v4l2_capability capability;
+-        int ret = ioctl(fd.get(), VIDIOC_QUERYCAP, &capability);
+-        if (ret < 0) {
+-            ALOGE("%s v4l2 QUERYCAP %s failed", __FUNCTION__, devName);
+-            return;
+-        }
+-
+-        if (!(capability.device_caps & V4L2_CAP_VIDEO_CAPTURE)) {
+-            ALOGW("%s device %s does not support VIDEO_CAPTURE", __FUNCTION__, devName);
+-            return;
+-        }
+-    }
+-
+-    // See if we can initialize ExternalCameraDevice correctly
+-    std::shared_ptr<ExternalCameraDevice> deviceImpl =
+-            ndk::SharedRefBase::make<ExternalCameraDevice>(devName, mCfg);
+-    if (deviceImpl == nullptr || deviceImpl->isInitFailed()) {
+-        ALOGW("%s: Attempt to init camera device %s failed!", __FUNCTION__, devName);
+-        return;
+-    }
+-    deviceImpl.reset();
+-    addExternalCamera(devName);
+-}
+-
+-void ExternalCameraProvider::deviceRemoved(const char* devName) {
+-    Mutex::Autolock _l(mLock);
+-    std::string deviceName;
+-    std::string cameraId =
+-            std::to_string(mCfg.cameraIdOffset + std::atoi(devName + kDevicePrefixLen));
+-
+-    deviceName =
+-            std::string("device@") + ExternalCameraDevice::kDeviceVersion + "/external/" + cameraId;
+-
+-    if (mCameraStatusMap.erase(deviceName) == 0) {
+-        // Unknown device, do not fire callback
+-        ALOGE("%s: cannot find camera device to remove %s", __FUNCTION__, devName);
+-        return;
+-    }
+-
+-    if (mCallback != nullptr) {
+-        mCallback->cameraDeviceStatusChange(deviceName, CameraDeviceStatus::NOT_PRESENT);
+-    }
+-}
+-
+-void ExternalCameraProvider::updateAttachedCameras() {
+-    ALOGV("%s start scanning for existing V4L2 devices", __FUNCTION__);
+-
+-    // Find existing /dev/video* devices
+-    DIR* devdir = opendir(kDevicePath);
+-    if (devdir == nullptr) {
+-        ALOGE("%s: cannot open %s! Exiting threadloop", __FUNCTION__, kDevicePath);
+-        return;
+-    }
+-
+-    struct dirent* de;
+-    while ((de = readdir(devdir)) != nullptr) {
+-        // Find external v4l devices that's existing before we start watching and add them
+-        if (!strncmp(kPrefix, de->d_name, kPrefixLen)) {
+-            std::string deviceId(de->d_name + kPrefixLen);
+-            if (mCfg.mInternalDevices.count(deviceId) == 0) {
+-                ALOGV("Non-internal v4l device %s found", de->d_name);
+-                char v4l2DevicePath[kMaxDevicePathLen];
+-                snprintf(v4l2DevicePath, kMaxDevicePathLen, "%s%s", kDevicePath, de->d_name);
+-                deviceAdded(v4l2DevicePath);
++        Mutex::Autolock _l(mLock);
++        mHost = std::move(host);
++        for (const HostCameraInfo& info : mHost->cameras()) {
++            std::string deviceName = std::string("device@") +
++                                     ExternalCameraDevice::kDeviceVersion + "/internal/" +
++                                     std::to_string(info.index);
++            auto device = ndk::SharedRefBase::make<ExternalCameraDevice>(
++                    info, std::to_string(info.index), mCfg);
++            if (device->isInitFailed()) {
++                ALOGW("%s: camera %s did not initialise", __FUNCTION__, deviceName.c_str());
++                continue;
+             }
++            ALOGI("%s: %s, facing %d, rotation %d, %zu sizes", __FUNCTION__, deviceName.c_str(),
++                  info.facing, info.rotation, info.sizes.size());
++            mCameras[deviceName] = info;
++            mCameraStatusMap[deviceName] = CameraDeviceStatus::PRESENT;
++            present.push_back(deviceName);
+         }
++        callback = mCallback;
+     }
+-    closedir(devdir);
+-}
+-
+-// Start ExternalCameraProvider::HotplugThread functions
+-
+-ExternalCameraProvider::HotplugThread::HotplugThread(ExternalCameraProvider* parent)
+-    : mParent(parent), mInternalDevices(parent->mCfg.mInternalDevices) {}
+-
+-ExternalCameraProvider::HotplugThread::~HotplugThread() {
+-    // Clean up inotify descriptor if needed.
+-    if (mINotifyFD >= 0) {
+-        close(mINotifyFD);
++    for (const auto& deviceName : present) {
++        if (callback != nullptr) {
++            callback->cameraDeviceStatusChange(deviceName, CameraDeviceStatus::PRESENT);
++        }
+     }
+ }
+ 
+-bool ExternalCameraProvider::HotplugThread::initialize() {
+-    // Update existing cameras
+-    mParent->updateAttachedCameras();
+-
+-    // Set up non-blocking fd. The threadLoop will be responsible for polling read at the
+-    // desired frequency
+-    mINotifyFD = inotify_init();
+-    if (mINotifyFD < 0) {
+-        ALOGE("%s: inotify init failed! Exiting threadloop", __FUNCTION__);
+-        return false;
+-    }
+-
+-    // Start watching /dev/ directory for created and deleted files
+-    mWd = inotify_add_watch(mINotifyFD, kDevicePath, IN_CREATE | IN_DELETE);
+-    if (mWd < 0) {
+-        ALOGE("%s: inotify add watch failed! Exiting threadloop", __FUNCTION__);
+-        return false;
++void ExternalCameraProvider::setAbsent() {
++    std::vector<std::string> absent;
++    std::shared_ptr<ICameraProviderCallback> callback;
++    {
++        Mutex::Autolock _l(mLock);
++        for (const auto& pair : mCameraStatusMap) {
++            absent.push_back(pair.first);
++        }
++        mCameraStatusMap.clear();
++        mCameras.clear();
++        mHost.reset();
++        callback = mCallback;
++    }
++    for (const auto& deviceName : absent) {
++        if (callback != nullptr) {
++            callback->cameraDeviceStatusChange(deviceName, CameraDeviceStatus::NOT_PRESENT);
++        }
+     }
+-
+-    mPollFd = {.fd = mINotifyFD, .events = POLLIN};
+-
+-    mIsInitialized = true;
+-    return true;
+ }
+ 
+-bool ExternalCameraProvider::HotplugThread::threadLoop() {
+-    // Initialize inotify descriptors if needed.
+-    if (!mIsInitialized && !initialize()) {
+-        return true;
+-    }
++ExternalCameraProvider::HostWatchThread::HostWatchThread(ExternalCameraProvider* parent)
++    : mParent(parent) {}
+ 
+-    // poll /dev/* and handle timeouts and error
+-    int pollRet = poll(&mPollFd, /* fd_count= */ 1, /* timeout= */ 250);
+-    if (pollRet == 0) {
+-        // no read event in 100ms
+-        mPollFd.revents = 0;
+-        return true;
+-    } else if (pollRet < 0) {
+-        ALOGE("%s: error while polling for /dev/*: %d", __FUNCTION__, errno);
+-        mPollFd.revents = 0;
+-        return true;
+-    } else if (mPollFd.revents & POLLERR) {
+-        ALOGE("%s: polling /dev/ returned POLLERR", __FUNCTION__);
+-        mPollFd.revents = 0;
+-        return true;
+-    } else if (mPollFd.revents & POLLHUP) {
+-        ALOGE("%s: polling /dev/ returned POLLHUP", __FUNCTION__);
+-        mPollFd.revents = 0;
+-        return true;
+-    } else if (mPollFd.revents & POLLNVAL) {
+-        ALOGE("%s: polling /dev/ returned POLLNVAL", __FUNCTION__);
+-        mPollFd.revents = 0;
+-        return true;
+-    }
+-    // mPollFd.revents must contain POLLIN, so safe to reset it before reading
+-    mPollFd.revents = 0;
++ExternalCameraProvider::HostWatchThread::~HostWatchThread() {}
+ 
+-    uint64_t offset = 0;
+-    ssize_t ret = read(mINotifyFD, mEventBuf, sizeof(mEventBuf));
+-    if (ret < sizeof(struct inotify_event)) {
+-        // invalid event. skip
++bool ExternalCameraProvider::HostWatchThread::threadLoop() {
++    std::shared_ptr<HostConnection> host = HostConnection::connect();
++    if (host == nullptr) {
++        std::this_thread::sleep_for(kReconnectDelay);
+         return true;
+     }
+-
+-    while (offset < ret) {
+-        struct inotify_event* event = (struct inotify_event*)&mEventBuf[offset];
+-        offset += sizeof(struct inotify_event) + event->len;
+-
+-        if (event->wd != mWd) {
+-            // event for an unrelated descriptor. ignore.
+-            continue;
+-        }
+-
+-        ALOGV("%s inotify_event %s", __FUNCTION__, event->name);
+-        if (strncmp(kPrefix, event->name, kPrefixLen) != 0) {
+-            // event not for /dev/video*. ignore.
+-            continue;
+-        }
+-
+-        std::string deviceId = event->name + kPrefixLen;
+-        if (mInternalDevices.count(deviceId) != 0) {
+-            // update to an internal device. ignore.
+-            continue;
+-        }
+-
+-        char v4l2DevicePath[kMaxDevicePathLen];
+-        snprintf(v4l2DevicePath, kMaxDevicePathLen, "%s%s", kDevicePath, event->name);
+-
+-        if (event->mask & IN_CREATE) {
+-            mParent->deviceAdded(v4l2DevicePath);
+-        } else if (event->mask & IN_DELETE) {
+-            mParent->deviceRemoved(v4l2DevicePath);
+-        }
+-    }
++    ALOGI("%s: the host has %zu camera(s)", __FUNCTION__, host->cameras().size());
++    mParent->setPresent(host);
++    host->waitClosed();
++    ALOGW("%s: the host closed the camera connection", __FUNCTION__);
++    mParent->setAbsent();
++    std::this_thread::sleep_for(kReconnectDelay);
+     return true;
+ }
+ 
+-// End ExternalCameraProvider::HotplugThread functions
+-
+ }  // namespace implementation
+ }  // namespace provider
+ }  // namespace camera
+diff --git a/camera/ExternalCameraProvider.h b/camera/ExternalCameraProvider.h
+index 347a53c..dec7e8c 100644
+--- a/camera/ExternalCameraProvider.h
++++ b/camera/ExternalCameraProvider.h
+@@ -26,7 +26,6 @@
+ #include <aidl/android/hardware/camera/provider/CameraIdAndStreamCombination.h>
+ #include <aidl/android/hardware/camera/provider/ConcurrentCameraIdCombination.h>
+ #include <aidl/android/hardware/camera/provider/ICameraProviderCallback.h>
+-#include <poll.h>
+ #include <utils/Mutex.h>
+ #include <utils/Thread.h>
+ #include <thread>
+@@ -68,44 +67,30 @@ class ExternalCameraProvider : public BnCameraProvider {
+             bool* _aidl_return) override;
+ 
+   private:
+-    void addExternalCamera(const char* devName);
+-    void deviceAdded(const char* devName);
+-    void deviceRemoved(const char* devName);
+-    void updateAttachedCameras();
++    void setPresent(std::shared_ptr<::android::hardware::camera::deckard::HostConnection> host);
++    void setAbsent();
+ 
+-    // A separate thread to monitor '/dev' directory for '/dev/video*' entries
+-    // This thread calls back into ExternalCameraProvider when an actionable change is detected.
+-    class HotplugThread : public SimpleThread {
++    // Follows deckard-camera: the cameras are present while a connection to it is open.
++    class HostWatchThread : public SimpleThread {
+       public:
+-        explicit HotplugThread(ExternalCameraProvider* parent);
+-        ~HotplugThread() override;
++        explicit HostWatchThread(ExternalCameraProvider* parent);
++        ~HostWatchThread() override;
+ 
+       protected:
+         bool threadLoop() override;
+ 
+       private:
+-        // Returns true if thread initialization succeeded, and false if thread initialization
+-        // failed.
+-        bool initialize();
+-
+         ExternalCameraProvider* mParent = nullptr;
+-        const std::unordered_set<std::string> mInternalDevices;
+-
+-        bool mIsInitialized = false;
+-
+-        int mINotifyFD = -1;
+-        int mWd = -1;
+-
+-        // struct to wrap mINotifyFD and poll it with timeout
+-        struct pollfd mPollFd = {};
+-        char mEventBuf[512] = {0};
+     };
+ 
+     Mutex mLock;
+     std::shared_ptr<ICameraProviderCallback> mCallback = nullptr;
+     std::unordered_map<std::string, CameraDeviceStatus> mCameraStatusMap;  // camera id -> status
++    // device name -> the host's camera
++    std::unordered_map<std::string, ::android::hardware::camera::deckard::HostCameraInfo> mCameras;
++    std::shared_ptr<::android::hardware::camera::deckard::HostConnection> mHost;
+     const ExternalCameraConfig mCfg;
+-    std::shared_ptr<HotplugThread> mHotPlugThread;
++    std::shared_ptr<HostWatchThread> mHostWatchThread;
+ };
+ 
+ }  // namespace implementation
+diff --git a/camera/ExternalCameraUtils.cpp b/camera/ExternalCameraUtils.cpp
+index 2dc3c77..098955e 100644
+--- a/camera/ExternalCameraUtils.cpp
++++ b/camera/ExternalCameraUtils.cpp
+@@ -21,8 +21,11 @@
+ 
+ #include <aidlcommonsupport/NativeHandle.h>
+ #include <jpeglib.h>
++#include <linux/dma-buf.h>
+ #include <linux/videodev2.h>
+ #include <log/log.h>
++#include <sys/ioctl.h>
++#include <sys/mman.h>
+ #include <algorithm>
+ #include <cinttypes>
+ #include <cmath>
+@@ -242,54 +245,70 @@ Frame::Frame(uint32_t width, uint32_t height, uint32_t fourcc)
+     : mWidth(width), mHeight(height), mFourcc(fourcc) {}
+ Frame::~Frame() {}
+ 
+-V4L2Frame::V4L2Frame(uint32_t w, uint32_t h, uint32_t fourcc, int bufIdx, int fd, uint32_t dataSize,
+-                     uint64_t offset)
+-    : Frame(w, h, fourcc), mBufferIndex(bufIdx), mFd(fd), mDataSize(dataSize), mOffset(offset) {}
++HostFrame::HostFrame(deckard::HostFrameData data, std::weak_ptr<deckard::HostConnection> host)
++    : Frame(data.width, data.height, deckard::kHostFourcc),
++      mFrame(std::move(data)),
++      mHost(std::move(host)) {}
+ 
+-V4L2Frame::~V4L2Frame() {
+-    unmap();
++HostFrame::~HostFrame() {
++    release();
+ }
+ 
+-int V4L2Frame::getData(uint8_t** outData, size_t* dataSize) {
++int HostFrame::getData(uint8_t** outData, size_t* dataSize) {
+     return map(outData, dataSize);
+ }
+ 
+-int V4L2Frame::map(uint8_t** data, size_t* dataSize) {
++int HostFrame::map(uint8_t** data, size_t* dataSize) {
+     if (data == nullptr || dataSize == nullptr) {
+-        ALOGI("%s: V4L2 buffer map bad argument: data %p, dataSize %p", __FUNCTION__, data,
+-              dataSize);
+         return -EINVAL;
+     }
+ 
+     std::lock_guard<std::mutex> lk(mLock);
+-    if (!mMapped) {
+-        void* addr = mmap(nullptr, mDataSize, PROT_READ, MAP_SHARED, mFd, mOffset);
++    if (mMapping == nullptr) {
++        if (mReleased) {
++            return -EINVAL;
++        }
++        size_t size = mFrame.offset + size_t{mFrame.stride} * mFrame.height;
++        void* addr = mmap(nullptr, size, PROT_READ, MAP_SHARED, mFrame.fd.get(), 0);
+         if (addr == MAP_FAILED) {
+-            ALOGE("%s: V4L2 buffer map failed: %s", __FUNCTION__, strerror(errno));
++            ALOGE("%s: host frame map failed: %s", __FUNCTION__, strerror(errno));
+             return -EINVAL;
+         }
+-        mData = static_cast<uint8_t*>(addr);
+-        mMapped = true;
++        dma_buf_sync sync{.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ};
++        ioctl(mFrame.fd.get(), DMA_BUF_IOCTL_SYNC, &sync);
++        mMapping = static_cast<uint8_t*>(addr);
++        mMappingSize = size;
+     }
+-    *data = mData;
+-    *dataSize = mDataSize;
+-    ALOGV("%s: V4L map FD %d, data %p size %zu", __FUNCTION__, mFd, mData, mDataSize);
++    *data = mMapping + mFrame.offset;
++    *dataSize = size_t{mFrame.stride} * mFrame.height;
+     return 0;
+ }
+ 
+-int V4L2Frame::unmap() {
++int HostFrame::unmap() {
+     std::lock_guard<std::mutex> lk(mLock);
+-    if (mMapped) {
+-        ALOGV("%s: V4L unmap data %p size %zu", __FUNCTION__, mData, mDataSize);
+-        if (munmap(mData, mDataSize) != 0) {
+-            ALOGE("%s: V4L2 buffer unmap failed: %s", __FUNCTION__, strerror(errno));
+-            return -EINVAL;
++    if (mMapping != nullptr) {
++        dma_buf_sync sync{.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ};
++        ioctl(mFrame.fd.get(), DMA_BUF_IOCTL_SYNC, &sync);
++        if (munmap(mMapping, mMappingSize) != 0) {
++            ALOGE("%s: host frame unmap failed: %s", __FUNCTION__, strerror(errno));
+         }
+-        mMapped = false;
++        mMapping = nullptr;
+     }
+     return 0;
+ }
+ 
++void HostFrame::release() {
++    unmap();
++    std::lock_guard<std::mutex> lk(mLock);
++    if (!mReleased) {
++        mReleased = true;
++        mFrame.fd.reset();
++        if (auto host = mHost.lock()) {
++            host->release(mFrame.id);
++        }
++    }
++}
++
+ AllocatedFrame::AllocatedFrame(uint32_t w, uint32_t h) : Frame(w, h, V4L2_PIX_FMT_YUV420) {}
+ AllocatedFrame::~AllocatedFrame() {}
+ 
+@@ -824,12 +843,12 @@ status_t fillCaptureResultCommon(CameraMetadata& md, nsecs_t timestamp,
+ #undef ARRAY_SIZE
+ #undef UPDATE
+ 
+-AllocatedV4L2Frame::AllocatedV4L2Frame(std::shared_ptr<V4L2Frame> frameIn)
++AllocatedHostFrame::AllocatedHostFrame(std::shared_ptr<HostFrame> frameIn)
+     : Frame(frameIn->mWidth, frameIn->mHeight, frameIn->mFourcc) {
+     uint8_t* dataIn;
+     size_t dataSize;
+     if (frameIn->getData(&dataIn, &dataSize) != 0) {
+-        ALOGE("%s: map input V4L2 frame failed!", __FUNCTION__);
++        ALOGE("%s: map input host frame failed!", __FUNCTION__);
+         return;
+     }
+ 
+@@ -837,9 +856,9 @@ AllocatedV4L2Frame::AllocatedV4L2Frame(std::shared_ptr<V4L2Frame> frameIn)
+     std::memcpy(mData.data(), dataIn, dataSize);
+ }
+ 
+-AllocatedV4L2Frame::~AllocatedV4L2Frame() {}
++AllocatedHostFrame::~AllocatedHostFrame() {}
+ 
+-int AllocatedV4L2Frame::getData(uint8_t** outData, size_t* dataSize) {
++int AllocatedHostFrame::getData(uint8_t** outData, size_t* dataSize) {
+     if (outData == nullptr || dataSize == nullptr) {
+         ALOGE("%s: outData(%p)/dataSize(%p) must not be null", __FUNCTION__, outData, dataSize);
+         return -1;
+diff --git a/camera/ExternalCameraUtils.h b/camera/ExternalCameraUtils.h
+index d434905..c39805b 100644
+--- a/camera/ExternalCameraUtils.h
++++ b/camera/ExternalCameraUtils.h
+@@ -29,6 +29,7 @@
+ #include <android/hardware/graphics/mapper/3.0/IMapper.h>
+ #include <android/hardware/graphics/mapper/4.0/IMapper.h>
+ #include <tinyxml2.h>
++#include <HostCamera.h>
+ #include <map>
+ #include <unordered_map>
+ #include <unordered_set>
+@@ -147,27 +148,26 @@ struct Frame : public std::enable_shared_from_this<Frame> {
+     virtual int getData(uint8_t** outData, size_t* dataSize) = 0;
+ };
+ 
+-// A class provide access to a dequeued V4L2 frame buffer (mostly in MJPG format)
+-// Also contains necessary information to enqueue the buffer back to V4L2 buffer queue
+-class V4L2Frame : public Frame {
++// A frame from the host: a mapped dma-buf, given back to the host by release().
++class HostFrame : public Frame {
+   public:
+-    V4L2Frame(uint32_t w, uint32_t h, uint32_t fourcc, int bufIdx, int fd, uint32_t dataSize,
+-              uint64_t offset);
+-    virtual ~V4L2Frame();
++    HostFrame(deckard::HostFrameData data, std::weak_ptr<deckard::HostConnection> host);
++    virtual ~HostFrame();
+ 
++    // The data is the frame's rows, stride * height bytes.
+     virtual int getData(uint8_t** outData, size_t* dataSize) override;
+ 
+-    const int mBufferIndex;  // for later enqueue
+     int map(uint8_t** data, size_t* dataSize);
+     int unmap();
++    void release();
+ 
+   private:
+     std::mutex mLock;
+-    const int mFd;  // used for mmap but doesn't claim ownership
+-    const size_t mDataSize;
+-    const uint64_t mOffset;  // used for mmap
+-    uint8_t* mData = nullptr;
+-    bool mMapped = false;
++    deckard::HostFrameData mFrame;
++    const std::weak_ptr<deckard::HostConnection> mHost;
++    uint8_t* mMapping = nullptr;
++    size_t mMappingSize = 0;
++    bool mReleased = false;
+ };
+ 
+ // A RAII class representing a CPU allocated YUV frame used as intermediate buffers
+@@ -286,11 +286,11 @@ struct OutputThreadInterface {
+     virtual ssize_t getJpegBufferSize(int32_t width, int32_t height) const = 0;
+ };
+ 
+-// A CPU copy of a mapped V4L2Frame. Will map the input V4L2 frame.
+-class AllocatedV4L2Frame : public Frame {
++// A CPU copy of a mapped HostFrame.
++class AllocatedHostFrame : public Frame {
+   public:
+-    AllocatedV4L2Frame(std::shared_ptr<V4L2Frame> frameIn);
+-    ~AllocatedV4L2Frame() override;
++    AllocatedHostFrame(std::shared_ptr<HostFrame> frameIn);
++    ~AllocatedHostFrame() override;
+     virtual int getData(uint8_t** outData, size_t* dataSize) override;
+ 
+   private:
+diff --git a/camera/HostCamera.cpp b/camera/HostCamera.cpp
+new file mode 100644
+index 0000000..4bf2d11
+--- /dev/null
++++ b/camera/HostCamera.cpp
+@@ -0,0 +1,314 @@
++/*
++ * Copyright (C) 2026 Marathon OS
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#define LOG_TAG "DeckardHostCam"
++
++#include "HostCamera.h"
++
++#include <log/log.h>
++#include <string.h>
++#include <unistd.h>
++
++#include <cinttypes>
++#include <sys/socket.h>
++#include <sys/un.h>
++
++namespace android {
++namespace hardware {
++namespace camera {
++namespace deckard {
++
++namespace {
++
++constexpr char kSocketPath[] = "/data/deckard/camera.sock";
++constexpr auto kReplyTimeout = std::chrono::seconds(10);
++
++constexpr uint32_t kVersion = 1;
++constexpr uint32_t kHello = 1;
++constexpr uint32_t kOpen = 2;
++constexpr uint32_t kStart = 3;
++constexpr uint32_t kStop = 4;
++constexpr uint32_t kRelease = 5;
++constexpr uint32_t kCamera = 101;
++constexpr uint32_t kCamerasEnd = 102;
++constexpr uint32_t kOk = 103;
++constexpr uint32_t kError = 104;
++constexpr uint32_t kFrame = 105;
++constexpr uint32_t kFailed = 106;
++
++constexpr size_t kMaxSizes = 32;
++constexpr size_t kMaxMessage = 16 + kMaxSizes * 12;
++
++uint32_t u32At(const uint8_t* bytes, size_t at) {
++    uint32_t value;
++    memcpy(&value, bytes + at, sizeof(value));
++    return value;
++}
++
++uint64_t u64At(const uint8_t* bytes, size_t at) {
++    uint64_t value;
++    memcpy(&value, bytes + at, sizeof(value));
++    return value;
++}
++
++class Message {
++  public:
++    explicit Message(uint32_t kind) { u32(kind); }
++    Message& u32(uint32_t value) {
++        append(&value, sizeof(value));
++        return *this;
++    }
++    Message& u64(uint64_t value) {
++        append(&value, sizeof(value));
++        return *this;
++    }
++    const std::vector<uint8_t>& bytes() const { return mBytes; }
++
++  private:
++    void append(const void* data, size_t size) {
++        auto* p = static_cast<const uint8_t*>(data);
++        mBytes.insert(mBytes.end(), p, p + size);
++    }
++    std::vector<uint8_t> mBytes;
++};
++
++HostError errorFrom(uint32_t code) {
++    switch (code) {
++        case 1:
++            return HostError::BUSY;
++        case 2:
++            return HostError::GONE;
++        case 4:
++            return HostError::INVALID;
++        default:
++            return HostError::BROKEN;
++    }
++}
++
++// One message and the descriptor it carries; size 0 when the host closed.
++ssize_t receive(int socket, uint8_t* bytes, size_t size, base::unique_fd* fd) {
++    union {
++        cmsghdr align;
++        char buf[CMSG_SPACE(sizeof(int))];
++    } control{};
++    iovec iov{.iov_base = bytes, .iov_len = size};
++    msghdr msg{};
++    msg.msg_iov = &iov;
++    msg.msg_iovlen = 1;
++    msg.msg_control = control.buf;
++    msg.msg_controllen = sizeof(control.buf);
++    ssize_t len = TEMP_FAILURE_RETRY(recvmsg(socket, &msg, MSG_CMSG_CLOEXEC));
++    for (cmsghdr* c = CMSG_FIRSTHDR(&msg); c != nullptr; c = CMSG_NXTHDR(&msg, c)) {
++        if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS &&
++            c->cmsg_len == CMSG_LEN(sizeof(int))) {
++            int received;
++            memcpy(&received, CMSG_DATA(c), sizeof(int));
++            fd->reset(received);
++        }
++    }
++    if (len > 0 && (msg.msg_flags & (MSG_TRUNC | MSG_CTRUNC))) {
++        errno = EMSGSIZE;
++        return -1;
++    }
++    return len;
++}
++
++}  // namespace
++
++std::shared_ptr<HostConnection> HostConnection::connect() {
++    base::unique_fd socket(::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0));
++    if (socket.get() < 0) {
++        return nullptr;
++    }
++    sockaddr_un addr{.sun_family = AF_UNIX};
++    strlcpy(addr.sun_path, kSocketPath, sizeof(addr.sun_path));
++    if (TEMP_FAILURE_RETRY(::connect(socket.get(), reinterpret_cast<sockaddr*>(&addr),
++                                     sizeof(addr))) != 0) {
++        ALOGV("%s: %s: %s", __FUNCTION__, kSocketPath, strerror(errno));
++        return nullptr;
++    }
++    std::shared_ptr<HostConnection> connection(new HostConnection(std::move(socket)));
++    if (!connection->readCameras()) {
++        return nullptr;
++    }
++    connection->mReader = std::thread([raw = connection.get()] { raw->readLoop(); });
++    return connection;
++}
++
++HostConnection::HostConnection(base::unique_fd socket) : mSocket(std::move(socket)) {}
++
++HostConnection::~HostConnection() {
++    shutdown(mSocket.get(), SHUT_RDWR);
++    if (mReader.joinable()) {
++        mReader.join();
++    }
++}
++
++bool HostConnection::send(const std::vector<uint8_t>& message) {
++    return TEMP_FAILURE_RETRY(::send(mSocket.get(), message.data(), message.size(),
++                                     MSG_NOSIGNAL)) == static_cast<ssize_t>(message.size());
++}
++
++bool HostConnection::readCameras() {
++    timeval timeout{.tv_sec = 5};
++    setsockopt(mSocket.get(), SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
++    if (!send(Message(kHello).u32(kVersion).bytes())) {
++        return false;
++    }
++    uint8_t bytes[kMaxMessage];
++    while (true) {
++        base::unique_fd unexpected;
++        ssize_t len = receive(mSocket.get(), bytes, sizeof(bytes), &unexpected);
++        if (len < 4) {
++            ALOGE("%s: no camera list from the host: %s", __FUNCTION__,
++                  len < 0 ? strerror(errno) : "closed");
++            return false;
++        }
++        uint32_t kind = u32At(bytes, 0);
++        if (kind == kCamerasEnd) {
++            break;
++        }
++        if (kind != kCamera || len < 20) {
++            ALOGE("%s: unexpected message %u", __FUNCTION__, kind);
++            return false;
++        }
++        uint32_t count = u32At(bytes, 16);
++        if (count > kMaxSizes || static_cast<size_t>(len) != 20 + count * 12) {
++            ALOGE("%s: malformed camera", __FUNCTION__);
++            return false;
++        }
++        HostCameraInfo info{.index = u32At(bytes, 4),
++                            .facing = static_cast<uint8_t>(u32At(bytes, 8)),
++                            .rotation = static_cast<int32_t>(u32At(bytes, 12) % 360)};
++        for (uint32_t i = 0; i < count; i++) {
++            size_t at = 20 + i * 12;
++            info.sizes.push_back({.width = static_cast<int32_t>(u32At(bytes, at)),
++                                  .height = static_cast<int32_t>(u32At(bytes, at + 4)),
++                                  .fps = u32At(bytes, at + 8)});
++        }
++        mCameras.push_back(std::move(info));
++    }
++    timeout.tv_sec = 0;
++    setsockopt(mSocket.get(), SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
++    return true;
++}
++
++void HostConnection::readLoop() {
++    uint8_t bytes[kMaxMessage];
++    while (true) {
++        base::unique_fd fd;
++        ssize_t len = receive(mSocket.get(), bytes, sizeof(bytes), &fd);
++        if (len < 4) {
++            if (len < 0) {
++                ALOGE("%s: %s", __FUNCTION__, strerror(errno));
++            }
++            break;
++        }
++        uint32_t kind = u32At(bytes, 0);
++        std::lock_guard<std::mutex> lk(mLock);
++        if (kind == kOk && len == 4) {
++            mReplies.push_back(HostError::NONE);
++        } else if (kind == kError && len == 8) {
++            mReplies.push_back(errorFrom(u32At(bytes, 4)));
++        } else if (kind == kFailed && len == 4) {
++            ALOGE("%s: the host's stream failed", __FUNCTION__);
++            mFailed = true;
++        } else if (kind == kFrame && len == 40 && fd.get() >= 0) {
++            HostFrameData frame{.id = u64At(bytes, 4),
++                                .timestamp = static_cast<nsecs_t>(u64At(bytes, 12)),
++                                .width = u32At(bytes, 20),
++                                .height = u32At(bytes, 24),
++                                .stride = u32At(bytes, 28),
++                                .offset = u32At(bytes, 32),
++                                .fd = std::move(fd)};
++            uint64_t size = u32At(bytes, 36);
++            if (frame.stride < uint64_t{frame.width} * 4 ||
++                size < uint64_t{frame.stride} * frame.height) {
++                ALOGE("%s: frame %" PRIu64 " is too small", __FUNCTION__, frame.id);
++                send(Message(kRelease).u64(frame.id).bytes());
++                continue;
++            }
++            if (mPending.has_value()) {
++                send(Message(kRelease).u64(mPending->id).bytes());
++            }
++            mPending = std::move(frame);
++        } else {
++            ALOGE("%s: unexpected message %u (%zd bytes)", __FUNCTION__, kind, len);
++            break;
++        }
++        mCond.notify_all();
++    }
++    std::lock_guard<std::mutex> lk(mLock);
++    mClosed = true;
++    mPending.reset();
++    mCond.notify_all();
++}
++
++HostError HostConnection::request(const std::vector<uint8_t>& message) {
++    std::unique_lock<std::mutex> lk(mLock);
++    mReplies.clear();
++    if (mClosed || !send(message)) {
++        return HostError::DISCONNECTED;
++    }
++    if (!mCond.wait_for(lk, kReplyTimeout, [this] { return mClosed || !mReplies.empty(); }) ||
++        mReplies.empty()) {
++        return HostError::DISCONNECTED;
++    }
++    HostError reply = mReplies.front();
++    mReplies.pop_front();
++    return reply;
++}
++
++HostError HostConnection::open(uint32_t camera) {
++    return request(Message(kOpen).u32(camera).bytes());
++}
++
++HostError HostConnection::start(uint32_t width, uint32_t height, uint32_t fps) {
++    {
++        std::lock_guard<std::mutex> lk(mLock);
++        mFailed = false;
++    }
++    return request(Message(kStart).u32(width).u32(height).u32(fps).bytes());
++}
++
++HostError HostConnection::stop() {
++    HostError reply = request(Message(kStop).bytes());
++    std::lock_guard<std::mutex> lk(mLock);
++    mPending.reset();
++    return reply;
++}
++
++std::optional<HostFrameData> HostConnection::nextFrame(std::chrono::milliseconds timeout) {
++    std::unique_lock<std::mutex> lk(mLock);
++    mCond.wait_for(lk, timeout, [this] { return mClosed || mFailed || mPending.has_value(); });
++    std::optional<HostFrameData> frame = std::move(mPending);
++    mPending.reset();
++    return frame;
++}
++
++void HostConnection::release(uint64_t id) {
++    send(Message(kRelease).u64(id).bytes());
++}
++
++void HostConnection::waitClosed() {
++    std::unique_lock<std::mutex> lk(mLock);
++    mCond.wait(lk, [this] { return mClosed; });
++}
++
++}  // namespace deckard
++}  // namespace camera
++}  // namespace hardware
++}  // namespace android
+diff --git a/camera/HostCamera.h b/camera/HostCamera.h
+new file mode 100644
+index 0000000..169d3e6
+--- /dev/null
++++ b/camera/HostCamera.h
+@@ -0,0 +1,113 @@
++/*
++ * Copyright (C) 2026 Marathon OS
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef HARDWARE_DECKARD_CAMERA_HOSTCAMERA_H_
++#define HARDWARE_DECKARD_CAMERA_HOSTCAMERA_H_
++
++#include <android-base/unique_fd.h>
++#include <utils/Timers.h>
++
++#include <chrono>
++#include <condition_variable>
++#include <deque>
++#include <memory>
++#include <mutex>
++#include <optional>
++#include <thread>
++#include <vector>
++
++namespace android {
++namespace hardware {
++namespace camera {
++namespace deckard {
++
++// The host's frames: DRM_FORMAT_ABGR8888, bytes R, G, B, A.
++constexpr uint32_t kHostFourcc = 0x34324241;  // 'AB24'
++
++// Frames the HAL may hold at once (the host's FRAMES_OUT).
++constexpr uint32_t kHostFrames = 2;
++
++struct HostSize {
++    int32_t width;
++    int32_t height;
++    uint32_t fps;
++};
++
++struct HostCameraInfo {
++    uint32_t index;
++    uint8_t facing;  // ANDROID_LENS_FACING_*
++    int32_t rotation;
++    std::vector<HostSize> sizes;
++};
++
++enum class HostError { NONE, BUSY, GONE, BROKEN, INVALID, DISCONNECTED };
++
++struct HostFrameData {
++    uint64_t id;
++    nsecs_t timestamp;
++    uint32_t width;
++    uint32_t height;
++    uint32_t stride;
++    uint32_t offset;
++    base::unique_fd fd;
++};
++
++// One connection to deckard-camera (docs/camera.md in Marathon-Deckard). The
++// host's side is host/deckard-camera there; wire.rs holds the messages.
++class HostConnection {
++  public:
++    // Connects and reads the host's cameras; null when the host is not there.
++    static std::shared_ptr<HostConnection> connect();
++    ~HostConnection();
++
++    const std::vector<HostCameraInfo>& cameras() const { return mCameras; }
++
++    // Acquires one camera for this connection.
++    HostError open(uint32_t camera);
++    HostError start(uint32_t width, uint32_t height, uint32_t fps);
++    HostError stop();
++
++    // The newest frame the HAL has not taken, waiting up to `timeout`.
++    std::optional<HostFrameData> nextFrame(std::chrono::milliseconds timeout);
++    void release(uint64_t id);
++
++    // Returns once the host has closed the connection.
++    void waitClosed();
++
++  private:
++    explicit HostConnection(base::unique_fd socket);
++    bool readCameras();
++    void readLoop();
++    HostError request(const std::vector<uint8_t>& message);
++    bool send(const std::vector<uint8_t>& message);
++
++    base::unique_fd mSocket;
++    std::vector<HostCameraInfo> mCameras;
++    std::thread mReader;
++    std::mutex mLock;
++    std::condition_variable mCond;
++    std::deque<HostError> mReplies;
++    std::optional<HostFrameData> mPending;
++    bool mClosed = false;
++    bool mFailed = false;
++};
++
++}  // namespace deckard
++}  // namespace camera
++}  // namespace hardware
++}  // namespace android
++
++#endif  // HARDWARE_DECKARD_CAMERA_HOSTCAMERA_H_
+diff --git a/camera/android.hardware.camera.provider-V1-deckard-service.rc b/camera/android.hardware.camera.provider-V1-deckard-service.rc
+new file mode 100644
+index 0000000..efd164d
+--- /dev/null
++++ b/camera/android.hardware.camera.provider-V1-deckard-service.rc
+@@ -0,0 +1,8 @@
++service vendor.camera.provider-deckard /vendor/bin/hw/android.hardware.camera.provider-V1-deckard-service
++    interface aidl android.hardware.camera.provider.ICameraProvider/deckard/0
++    class hal
++    user cameraserver
++    group audio camera input drmrpc usb
++    ioprio rt 4
++    capabilities SYS_NICE
++    task_profiles CameraServiceCapacity MaxPerformance
+diff --git a/camera/android.hardware.camera.provider-V1-deckard-service.xml b/camera/android.hardware.camera.provider-V1-deckard-service.xml
+new file mode 100644
+index 0000000..61a41fd
+--- /dev/null
++++ b/camera/android.hardware.camera.provider-V1-deckard-service.xml
+@@ -0,0 +1,7 @@
++<manifest version="1.0" type="device">
++    <hal format="aidl">
++        <name>android.hardware.camera.provider</name>
++        <version>1</version>
++        <fqname>ICameraProvider/deckard/0</fqname>
++    </hal>
++</manifest>
+diff --git a/camera/external-service.cpp b/camera/service.cpp
+similarity index 76%
+rename from camera/external-service.cpp
+rename to camera/service.cpp
+index b18f182..be26aab 100644
+--- a/camera/external-service.cpp
++++ b/camera/service.cpp
+@@ -27,25 +27,18 @@ const int HWBINDER_THREAD_COUNT = 6;
+ }  // namespace
+ 
+ int main() {
+-    ALOGI("CameraProvider: external webcam service is starting.");
++    ALOGI("CameraProvider: Deckard host camera service is starting.");
+ 
+     ABinderProcess_setThreadPoolMaxThreadCount(HWBINDER_THREAD_COUNT);
+ 
+     std::shared_ptr<ExternalCameraProvider> defaultProvider =
+             ndk::SharedRefBase::make<ExternalCameraProvider>();
+-    const std::string serviceName = std::string(ExternalCameraProvider::descriptor) + "/external/0";
+-
+-#ifdef LAZY_SERVICE
+-    binder_exception_t ret = AServiceManager_registerLazyService(defaultProvider->asBinder().get(),
+-                                                                 serviceName.c_str());
+-    LOG_ALWAYS_FATAL_IF(ret != EX_NONE,
+-                        "Error while registering lazy ext camera provider service: %d", ret);
+-#else
++    const std::string serviceName = std::string(ExternalCameraProvider::descriptor) + "/deckard/0";
++
+     binder_exception_t ret =
+             AServiceManager_addService(defaultProvider->asBinder().get(), serviceName.c_str());
+-    LOG_ALWAYS_FATAL_IF(ret != EX_NONE, "Error while registering ext camera provider service: %d",
++    LOG_ALWAYS_FATAL_IF(ret != EX_NONE, "Error while registering camera provider service: %d",
+                         ret);
+-#endif
+ 
+     ABinderProcess_joinThreadPool();
+     return EXIT_FAILURE;  // should not reach

@@ -1,0 +1,22 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: patrickjquinn <patrick.jm.quinn@gmail.com>
+Date: Mon, 2 Nov 2026 18:03:55 +0000
+Subject: [PATCH] hostaidls: Keep ICameraProvider in the container
+
+Deckard's hosts have no Halium servicemanager. The entry routed every
+ICameraProvider lookup and registration to /dev/host_binder, so the
+container's own camera provider could not be found.
+---
+ hostaidls.conf | 1 -
+ 1 file changed, 1 deletion(-)
+
+diff --git a/hostaidls.conf b/hostaidls.conf
+index e5d9229..b50540b 100644
+--- a/hostaidls.conf
++++ b/hostaidls.conf
+@@ -5,5 +5,4 @@
+ # Consumed by frameworks/native libbinder (host-AIDL passthrough patch),
+ # loaded from /system/etc/hostaidls.conf.
+ 
+-android.hardware.camera.provider.ICameraProvider
+ android.hardware.graphics.allocator.IAllocator
