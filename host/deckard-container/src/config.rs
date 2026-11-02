@@ -13,9 +13,10 @@ use crate::Result;
 const MAX_BYTES: u64 = 1024 * 1024;
 
 /// Keys upstream fills in when the file lacks them.
-pub const DEFAULTS: [(&str, &str); 3] = [
+pub const DEFAULTS: [(&str, &str); 4] = [
     ("suspend_action", "freeze"),
     ("mount_overlays", "True"),
+    ("userns", "False"),
     ("auto_adb", "False"),
 ];
 

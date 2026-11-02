@@ -188,12 +188,15 @@ fn sources(fields: &HashMap<String, String>, uid: u32, runtime_root: &Path) -> R
     })
 }
 
-/// The `config_session` text for a stage.
+/// The `config_session` text for a stage. In a user namespace (`userns`)
+/// the binds are idmapped, so the session's files keep their Android ids on
+/// disk and only these mounts give Android's ids any access to them.
 #[must_use]
-pub fn render(stage: &Stage, pulse: bool) -> String {
+pub fn render(stage: &Stage, pulse: bool, userns: bool) -> String {
+    let idmap = if userns { ",idmap=container" } else { "" };
     let mut config = format!(
         "lxc.mount.entry = tmpfs /run/xdg none create=dir 0 0\n\
-         lxc.mount.entry = {} run/xdg/wayland-0 none rbind,create=file 0 0\n",
+         lxc.mount.entry = {} run/xdg/wayland-0 none rbind,create=file{idmap} 0 0\n",
         stage.wayland().display()
     );
     if pulse {
@@ -201,13 +204,13 @@ pub fn render(stage: &Stage, pulse: bool) -> String {
         let pulse = pulse.display();
         let _ = writeln!(
             config,
-            "lxc.mount.entry = {pulse} run/xdg/pulse/native none rbind,create=file 0 0"
+            "lxc.mount.entry = {pulse} run/xdg/pulse/native none rbind,create=file{idmap} 0 0"
         );
     }
     let data = stage.data();
     let _ = writeln!(
         config,
-        "lxc.mount.entry = {} data none rbind 0 0",
+        "lxc.mount.entry = {} data none rbind{idmap} 0 0",
         data.display()
     );
     config
@@ -225,9 +228,10 @@ pub fn write(
     uid: u32,
     runtime_root: &Path,
     stage: &Stage,
+    userns: bool,
 ) -> Result<()> {
     let sources = sources(fields, uid, runtime_root)?;
-    let config = render(stage, sources.pulse.is_some());
+    let config = render(stage, sources.pulse.is_some(), userns);
     let directory = fs::symlink_metadata(lxc_instance)?;
     let trusted = directory.is_dir()
         && directory.uid() == rustix::process::geteuid().as_raw()
@@ -322,13 +326,13 @@ mod tests {
     fn config_names_only_the_root_owned_stage() {
         let stage = Stage::new(Path::new("/run/deckard-lxc"));
         assert_eq!(
-            render(&stage, true),
+            render(&stage, true, false),
             "lxc.mount.entry = tmpfs /run/xdg none create=dir 0 0\n\
              lxc.mount.entry = /run/deckard-lxc/session/wayland-0 run/xdg/wayland-0 none rbind,create=file 0 0\n\
              lxc.mount.entry = /run/deckard-lxc/session/pulse-native run/xdg/pulse/native none rbind,create=file 0 0\n\
              lxc.mount.entry = /run/deckard-lxc/session/data data none rbind 0 0\n"
         );
-        assert!(!render(&stage, false).contains("pulse"));
+        assert!(!render(&stage, false, false).contains("pulse"));
     }
 
     #[test]

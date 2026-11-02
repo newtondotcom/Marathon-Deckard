@@ -234,9 +234,20 @@ impl Backend {
             _ => return Err("invalid mount_overlays".into()),
         };
         self.suspend_stops = config::get_or_default(&text, "suspend_action") == Some("stop");
+        let userns = match config::get_or_default(&text, "userns") {
+            Some("True") => true,
+            Some("False") => false,
+            _ => return Err("invalid userns".into()),
+        };
+        self.manager.mounts.userns = userns;
+        self.manager.lxc.userns = userns;
         let dev = Path::new("/dev");
         drivers::ensure_binder_nodes()?;
         DriverNodes::from_config(&self.config_path())?.prepare(dev)?;
+        // In a user namespace Android opens its own copies of the nodes.
+        if userns {
+            return Ok(());
+        }
         drivers::open_device_access(dev, Path::new("/sys/kernel/debug/sync/sw_sync"))
     }
 
@@ -290,7 +301,15 @@ impl Backend {
         self.prepare_production()?;
         let stage = Stage::new(&self.manager.network.runtime);
         let instance = self.manager.lxc.root.join(&self.manager.lxc.name);
-        session_config::write(&instance, fields, uid, Path::new("/run/user"), &stage)?;
+        let userns = self.manager.lxc.userns;
+        session_config::write(
+            &instance,
+            fields,
+            uid,
+            Path::new("/run/user"),
+            &stage,
+            userns,
+        )?;
         let started = properties::write(&self.manager.mounts.work, fields, uid)
             .and_then(|()| self.manager.start());
         if let Err(error) = started {
@@ -805,6 +824,7 @@ mod tests {
                 work: "/nonexistent".into(),
                 images: "/nonexistent/images".into(),
                 overlays: true,
+                userns: false,
             },
             network: Network::new("deckard0".into(), "/nonexistent/run".into())?,
         };
