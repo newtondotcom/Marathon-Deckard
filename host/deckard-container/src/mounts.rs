@@ -5,14 +5,26 @@
 //! from descriptors instead (`session_config`).
 
 use std::fs;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt, lchown};
 use std::path::{Component, Path, PathBuf};
 
 use deckard_host_tools::files;
-use deckard_host_tools::names::android;
+use deckard_host_tools::names::{USERNS_BASE, USERNS_IDS, android};
 
 use crate::Result;
 use crate::command::{self, Command};
+
+/// Where Android's apexd finds the APEX payloads the host mounts in a user
+/// namespace (system/apex 0003, kHostPayloads), each at its APEX file's path.
+const HOST_APEX: &str = "deckard_apex";
+/// Android's directories of pre-installed APEXes, with where each is in the
+/// rootfs: system_ext and product are symlinks into system there.
+const APEX_DIRS: [(&str, &str); 4] = [
+    ("system/apex", "system/apex"),
+    ("system_ext/apex", "system/system_ext/apex"),
+    ("product/apex", "system/product/apex"),
+    ("vendor/apex", "vendor/apex"),
+];
 
 #[derive(Clone, Debug)]
 pub struct MountLayout {
@@ -20,6 +32,10 @@ pub struct MountLayout {
     pub images: PathBuf,
     /// Whether `overlay/` is mounted over the images (`mount_overlays`).
     pub overlays: bool,
+    /// Whether Android runs in its own user namespace (`userns`): the images
+    /// and `overlay/` are then mounted idmapped into its ids, and the
+    /// writable layers are kept in them on disk.
+    pub userns: bool,
 }
 
 fn display(path: &Path) -> String {
@@ -30,6 +46,11 @@ impl MountLayout {
     #[must_use]
     pub fn rootfs(&self) -> PathBuf {
         self.work.join("rootfs")
+    }
+
+    /// `overlay/` as Android's user namespace sees it.
+    fn overlay_idmapped(&self) -> PathBuf {
+        self.work.join("overlay_idmap")
     }
 
     /// # Errors
@@ -62,17 +83,29 @@ impl MountLayout {
         self.preflight()?;
         let root = self.rootfs();
         let mut commands = Vec::new();
+        let (image_options, overlay) = if self.userns {
+            let idmap = format!("X-mount.idmap=b:0:{USERNS_BASE}:{USERNS_IDS}");
+            let overlay = self.overlay_idmapped();
+            if self.overlays {
+                commands.push(Command::new([
+                    "mount",
+                    "--bind",
+                    "-o",
+                    &idmap,
+                    &display(&self.work.join("overlay")),
+                    &display(&overlay),
+                ]));
+            }
+            (format!("ro,loop,{idmap}"), overlay)
+        } else {
+            ("ro,loop".to_owned(), self.work.join("overlay"))
+        };
         for (image, target, lower, overlay) in [
-            (
-                "system.img",
-                root.clone(),
-                self.work.join("overlay"),
-                "system",
-            ),
+            ("system.img", root.clone(), overlay.clone(), "system"),
             (
                 "vendor.img",
                 root.join("vendor"),
-                self.work.join("overlay/vendor"),
+                overlay.join("vendor"),
                 "vendor",
             ),
         ] {
@@ -80,7 +113,7 @@ impl MountLayout {
             commands.push(Command::new([
                 "mount",
                 "-o",
-                "ro,loop",
+                &image_options,
                 &image,
                 &display(&target),
             ]));
@@ -124,31 +157,114 @@ impl MountLayout {
         for path in [
             self.rootfs(),
             self.rootfs().join("vendor"),
-            self.work.join("overlay_rw/system"),
+            self.overlay_idmapped(),
             self.work.join("overlay_work/system"),
-            self.work.join("overlay_rw/vendor"),
             self.work.join("overlay_work/vendor"),
         ] {
             owner_controlled(&path)?;
             fs::create_dir_all(&path)?;
             safe_dir(&path)?;
         }
+        // An upper layer is the container's own tree, so in a user namespace
+        // its root belongs to Android's root; its parent keeps it root's to
+        // swap.
+        let uppers = [
+            self.work.join("overlay_rw/system"),
+            self.work.join("overlay_rw/vendor"),
+        ];
+        for upper in &uppers {
+            let parent = upper.parent().ok_or("upper layer has no parent")?;
+            owner_controlled(parent)?;
+            fs::create_dir_all(upper)?;
+            safe_dir(parent)?;
+            crate::ensure(
+                fs::symlink_metadata(upper)?.is_dir(),
+                format!("upper layer is not a directory: {}", upper.display()),
+            )?;
+        }
         let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
-        if !mountpoints_beneath(&self.rootfs(), &mountinfo).is_empty() {
+        if !mountpoints_beneath(&self.rootfs(), &mountinfo).is_empty()
+            || !mountpoints_beneath(&self.overlay_idmapped(), &mountinfo).is_empty()
+        {
             return Err("rootfs already contains mounts".into());
         }
+        for upper in &uppers {
+            shift_ids(upper, self.userns)?;
+        }
+        // apexd takes the payloads from the host whenever this exists.
+        let payloads = self.work.join("overlay_rw/system").join(HOST_APEX);
+        if !self.userns && fs::symlink_metadata(&payloads).is_ok() {
+            fs::remove_dir_all(&payloads)?;
+        }
         let mut completed = Vec::new();
-        for command in commands {
-            let target = command.args.last().cloned().ok_or("mount target missing")?;
-            if let Err(error) = command::run(command) {
-                for target in completed.into_iter().rev() {
-                    let _ = command::run(Command::new(["umount".into(), target]));
-                }
-                return Err(error);
+        let run = |commands: Vec<Command>, completed: &mut Vec<String>| -> Result<()> {
+            for command in commands {
+                let target = command.args.last().cloned().ok_or("mount target missing")?;
+                command::run(command)?;
+                completed.push(target);
             }
-            completed.push(target);
+            Ok(())
+        };
+        let mut result = run(commands, &mut completed);
+        if result.is_ok() && self.userns {
+            result = self
+                .apex_payloads()
+                .and_then(|commands| run(commands, &mut completed));
+        }
+        if let Err(error) = result {
+            for target in completed.into_iter().rev() {
+                let _ = command::run(Command::new(["umount".into(), target]));
+            }
+            return Err(error);
         }
         Ok(())
+    }
+
+    /// The mounts of the pre-installed APEXes' payloads, read-only and
+    /// idmapped, for apexd to bind (`userns`).
+    ///
+    /// # Errors
+    /// An APEX directory cannot be read, or an APEX is not a zip with a
+    /// stored payload.
+    fn apex_payloads(&self) -> Result<Vec<Command>> {
+        let root = self.rootfs();
+        let mut commands = Vec::new();
+        for (android, host) in APEX_DIRS {
+            let Some(entries) = files::found(fs::read_dir(root.join(host)))? else {
+                continue;
+            };
+            for entry in entries {
+                let path = entry?.path();
+                if path.extension().is_none_or(|extension| extension != "apex") {
+                    continue;
+                }
+                let mut apex = zip::ZipArchive::new(fs::File::open(&path)?)?;
+                let payload = apex.by_name("apex_payload.img")?;
+                let offset = payload
+                    .data_start()
+                    .ok_or("APEX payload has no data offset")?;
+                crate::ensure(
+                    payload.compression() == zip::CompressionMethod::Stored,
+                    format!("APEX payload is compressed: {}", path.display()),
+                )?;
+                let name = path.file_name().ok_or("APEX without a name")?;
+                let target = root.join(HOST_APEX).join(android).join(name);
+                validate_path_syntax(&target)?;
+                fs::create_dir_all(&target)?;
+                let options = format!(
+                    "ro,nodev,noatime,loop,offset={offset},sizelimit={},X-mount.idmap=b:0:{USERNS_BASE}:{USERNS_IDS}",
+                    payload.size()
+                );
+                commands.push(Command::new([
+                    "mount".to_owned(),
+                    "-o".to_owned(),
+                    options,
+                    display(&path),
+                    display(&target),
+                ]));
+            }
+        }
+        Ok(commands)
     }
 
     /// Whether anything is mounted beneath the rootfs.
@@ -165,11 +281,45 @@ impl MountLayout {
     pub fn unmount(&self) -> Result<()> {
         safe_dir(&self.work)?;
         let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
-        for mountpoint in mountpoints_beneath(&self.rootfs(), &mountinfo) {
+        let mountpoints = mountpoints_beneath(&self.rootfs(), &mountinfo)
+            .into_iter()
+            .chain(mountpoints_beneath(&self.overlay_idmapped(), &mountinfo));
+        for mountpoint in mountpoints {
             command::run(Command::new(["umount".into(), display(&mountpoint)]))?;
         }
         Ok(())
     }
+}
+
+/// Moves the owners of everything under `root` into Android's user
+/// namespace ids (`into`) or back out. Each file is shifted alone and only
+/// when it is on the other side, so an interrupted run resumes where it
+/// stopped and a layer written in either mode converts.
+fn shift_ids(root: &Path, into: bool) -> Result<()> {
+    let shift = |id: u32| match (into, id >= USERNS_BASE) {
+        (true, false) if id < USERNS_IDS => Some(id + USERNS_BASE),
+        (false, true) if id - USERNS_BASE < USERNS_IDS => Some(id - USERNS_BASE),
+        _ => None,
+    };
+    let metadata = fs::symlink_metadata(root)?;
+    let (uid, gid) = (shift(metadata.uid()), shift(metadata.gid()));
+    if metadata.is_dir() {
+        for entry in fs::read_dir(root)? {
+            shift_ids(&entry?.path(), into)?;
+        }
+    }
+    if uid.is_some() || gid.is_some() {
+        lchown(
+            root,
+            uid.or(Some(metadata.uid())),
+            gid.or(Some(metadata.gid())),
+        )?;
+        // chown clears set-id bits; put the mode back.
+        if !metadata.is_symlink() {
+            fs::set_permissions(root, fs::Permissions::from_mode(metadata.mode() & 0o7777))?;
+        }
+    }
+    Ok(())
 }
 
 fn validate_path_syntax(path: &Path) -> Result<()> {

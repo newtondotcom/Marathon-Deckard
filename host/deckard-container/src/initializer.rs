@@ -121,12 +121,7 @@ pub fn host_devices() -> Result<BTreeSet<String>> {
             paths.insert(path.to_owned());
         }
     }
-    for (dir, prefix) in [
-        ("/dev", "fb"),
-        ("/dev/graphics", "fb"),
-        ("/dev", "video"),
-        ("/dev/dma_heap", ""),
-    ] {
+    for (dir, prefix) in [("/dev", "video"), ("/dev/dma_heap", "")] {
         let Ok(entries) = fs::read_dir(dir) else {
             continue;
         };
@@ -204,6 +199,46 @@ impl Host {
     }
 }
 
+/// The mount entries `config_nodes` holds for `host`, from [`NODES`]: device
+/// nodes, `/dev` mounts and the work directory's binds.
+#[must_use]
+pub fn node_entries(host: &Host, work: &Path) -> Vec<String> {
+    let (devices, nodes) = (&host.devices, &host.nodes);
+    let file = |path: &str| format!("{path} {} none bind,create=file,optional", &path[1..]);
+    let mut entries = Vec::new();
+    for line in NODES.lines() {
+        let optional = line
+            .strip_prefix('?')
+            .map(|rest| rest.split_once(' ').unwrap_or((rest, "")));
+        match (line, optional) {
+            ("@render", _) => entries.extend(host.render_node.as_deref().map(file)),
+            ("@devices", _) => {
+                for prefix in ["/dev/video", "/dev/dma_heap/"] {
+                    let under = devices.iter().filter(|path| path.starts_with(prefix));
+                    entries.extend(under.map(|path| file(path)));
+                }
+            }
+            ("@binder", _) => {
+                let binders = [
+                    (&nodes.binder, "binder"),
+                    (&nodes.vndbinder, "vndbinder"),
+                    (&nodes.hwbinder, "hwbinder"),
+                ];
+                for (name, target) in binders {
+                    entries.push(format!(
+                        "/dev/{name} dev/{target} none bind,create=file,optional"
+                    ));
+                }
+            }
+            (_, None) => entries.push(line.replace("@WORK@", &work.to_string_lossy())),
+            (_, Some((path, _))) if !devices.contains(path) => {}
+            (_, Some((path, ""))) => entries.push(file(path)),
+            (_, Some((path, tail))) => entries.push(format!("{path} {tail}")),
+        }
+    }
+    entries
+}
+
 fn kernel_driver(drm: &Path, node: &str) -> Option<String> {
     let name = Path::new(node).file_name()?;
     let uevent = fs::read_to_string(drm.join(name).join("device/uevent")).ok()?;
@@ -273,48 +308,8 @@ impl Init<'_> {
     }
 
     fn render_nodes(&self) -> String {
-        let (devices, nodes) = (&self.host.devices, &self.host.nodes);
-        let file = |path: &str| format!("{path} {} none bind,create=file,optional", &path[1..]);
-        let mut entries = Vec::new();
-        for line in NODES.lines() {
-            let optional = line
-                .strip_prefix('?')
-                .map(|rest| rest.split_once(' ').unwrap_or((rest, "")));
-            match (line, optional) {
-                ("@render", _) => entries.extend(self.host.render_node.as_deref().map(file)),
-                ("@devices", _) => {
-                    for prefix in [
-                        "/dev/fb",
-                        "/dev/graphics/fb",
-                        "/dev/video",
-                        "/dev/dma_heap/",
-                    ] {
-                        let under = devices.iter().filter(|path| path.starts_with(prefix));
-                        entries.extend(under.map(|path| file(path)));
-                    }
-                }
-                ("@binder", _) => {
-                    let binders = [
-                        (&nodes.binder, "binder"),
-                        (&nodes.vndbinder, "vndbinder"),
-                        (&nodes.hwbinder, "hwbinder"),
-                    ];
-                    for (name, target) in binders {
-                        entries.push(format!(
-                            "/dev/{name} dev/{target} none bind,create=file,optional"
-                        ));
-                    }
-                }
-                (_, None) => {
-                    entries.push(line.replace("@WORK@", &self.instance.work.to_string_lossy()))
-                }
-                (_, Some((path, _))) if !devices.contains(path) => {}
-                (_, Some((path, ""))) => entries.push(file(path)),
-                (_, Some((path, tail))) => entries.push(format!("{path} {tail}")),
-            }
-        }
         let mut text = String::new();
-        for entry in entries {
+        for entry in node_entries(&self.host, &self.instance.work) {
             let _ = writeln!(text, "lxc.mount.entry = {entry} 0 0");
         }
         text
@@ -752,13 +747,7 @@ mod tests {
         }
 
         fn init(&self, images: Images) -> Result<Init<'_>> {
-            let devices = [
-                "/dev/zero",
-                "/dev/fuse",
-                "/dev/char",
-                "/dev/fb0",
-                "/dev/net/tun",
-            ];
+            let devices = ["/dev/zero", "/dev/fuse", "/dev/char", "/dev/net/tun"];
             Ok(Init {
                 instance: &self.instance,
                 images,
@@ -836,7 +825,6 @@ mod tests {
             format!("/dev/fuse dev/fuse {file}"),
             "/dev/char dev/char none bind,create=dir,optional".to_owned(),
             format!("/dev/dri/renderD128 dev/dri/renderD128 {file}"),
-            format!("/dev/fb0 dev/fb0 {file}"),
             format!("/dev/binder dev/binder {file}"),
             format!("/dev/vndbinder dev/vndbinder {file}"),
             format!("/dev/hwbinder dev/hwbinder {file}"),

@@ -15,6 +15,8 @@ use crate::network::Network;
 pub struct Lxc {
     pub root: PathBuf,
     pub name: String,
+    /// Whether the container gets its own user namespace (`userns`).
+    pub userns: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -34,7 +36,11 @@ impl Lxc {
         if !root.is_absolute() || name.is_empty() || !plain {
             return Err("invalid LXC root or container name".into());
         }
-        Ok(Self { root, name })
+        Ok(Self {
+            root,
+            name,
+            userns: false,
+        })
     }
 
     fn command(&self, program: &str, tail: &[&str]) -> Command {
@@ -120,8 +126,9 @@ impl Lxc {
     }
 
     /// # Errors
-    /// The container is not stopped, its config is not a regular file, or
-    /// it does not start within 10 seconds.
+    /// The container is not stopped, its config is not a regular file, its
+    /// device rules cannot be written, or it does not start within 10
+    /// seconds.
     pub fn start(&self) -> Result<()> {
         if self.status()? != State::Stopped {
             return Err("container is not stopped".into());
@@ -130,7 +137,9 @@ impl Lxc {
         if !fs::symlink_metadata(&config).is_ok_and(|metadata| metadata.is_file()) {
             return Err(format!("LXC config is not a regular file: {}", config.display()).into());
         }
-        command::run(self.command("lxc-start", &["-d", "--", "/init"]))?;
+        let devices = crate::devices::write(&self.root.join(&self.name), self.userns)?;
+        let include = format!("lxc.include={}", devices.display());
+        command::run(self.command("lxc-start", &["-d", "-s", &include, "--", "/init"]))?;
         self.wait_for(State::Running, Duration::from_secs(10))
     }
 

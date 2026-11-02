@@ -2,13 +2,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use async_signal::{Signal, Signals};
-use deckard_container::dbus;
 use deckard_container::drivers::DriverNodes;
 use deckard_container::lxc::{ContainerManager, Lxc};
 use deckard_container::mounts::MountLayout;
 use deckard_container::network::Network;
 use deckard_container::session_config::{self, Stage};
 use deckard_container::{Result, hardware, properties};
+use deckard_container::{config, dbus};
 use deckard_host_tools::names;
 use deckard_launch::binder::{self, BinderConfig};
 use deckard_launch::session::ContainerManagerProxy;
@@ -28,7 +28,9 @@ fn audit_production() -> Result<()> {
     let work = Path::new(names::WORK);
     DriverNodes::from_config(&work.join("deckard.cfg"))?.audit(Path::new("/dev"))?;
     let pulse = session_config::check(&fields, uid, Path::new("/run/user"))?;
-    let rendered = session_config::render(&Stage::new(Path::new(names::RUN)), pulse);
+    let cfg = config::read(&work.join("deckard.cfg"))?;
+    let userns = config::get_or_default(&cfg, "userns") == Some("True");
+    let rendered = session_config::render(&Stage::new(Path::new(names::RUN)), pulse, userns);
     if rendered
         != fs::read_to_string(
             work.join("lxc")
@@ -79,6 +81,7 @@ fn main() -> Result<()> {
             images: work.join("images"),
             work,
             overlays: true,
+            userns: false,
         },
         network: Network::new(names::BRIDGE.into(), names::RUN.into())?,
     };

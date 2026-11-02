@@ -5,6 +5,7 @@
 pub mod command;
 pub mod config;
 pub mod dbus;
+pub mod devices;
 pub mod drivers;
 pub mod hardware;
 pub mod initializer;

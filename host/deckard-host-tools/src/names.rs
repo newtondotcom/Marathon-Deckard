@@ -12,6 +12,12 @@ pub const CGROUP: &str = "/sys/fs/cgroup/lxc.payload.deckard";
 pub const BRIDGE: &str = "deckard0";
 /// Runtime files shared with LXC.
 pub const RUN: &str = "/run/deckard-lxc";
+/// With `userns = True`, Android's uid and gid 0 is this host id, and its
+/// ids up to [`USERNS_IDS`] (Android users 0 to 9) follow it. The range is
+/// root's in `/etc/subuid` and `/etc/subgid`, above systemd's container
+/// ranges and below its foreign range.
+pub const USERNS_BASE: u32 = 0x7000_0000;
+pub const USERNS_IDS: u32 = 0x10_0000;
 /// The user's state under `XDG_DATA_HOME`; Android's `/data` is its `data`.
 pub const USER_STATE: &str = "deckard";
 /// In `XDG_RUNTIME_DIR` while the session asks for the container.

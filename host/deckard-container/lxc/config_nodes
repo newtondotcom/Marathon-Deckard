@@ -21,7 +21,7 @@ none dev/pts devpts defaults,mode=644,ptmxmode=666,create=dir
 ?/sys/module/lowmemorykiller sys/module/lowmemorykiller none bind,create=dir,optional
 @WORK@/host-permissions vendor/etc/host-permissions none bind,optional
 ?/dev/sw_sync
-?/sys/kernel/debug sys/kernel/debug none rbind,create=dir,optional
+?/sys/kernel/debug/sync/sw_sync sys/kernel/debug/sync/sw_sync none bind,create=file,optional
 ?/sys/class/leds/vibrator sys/class/leds/vibrator none bind,create=dir,optional
 ?/sys/devices/virtual/timed_output/vibrator sys/devices/virtual/timed_output/vibrator none bind,create=dir,optional
 ?/dev/Vcodec
