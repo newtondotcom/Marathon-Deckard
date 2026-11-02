@@ -1,0 +1,114 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: patrickjquinn <patrick.jm.quinn@gmail.com>
+Date: Mon, 2 Nov 2026 16:24:17 +0000
+Subject: [PATCH] apexd: Bind the payloads the host mounts in a user namespace
+
+Deckard can run Android in a user namespace of its own, where apexd can
+neither attach loop devices nor mount ext4 or erofs. On the Zinwa Q25
+apexd-bootstrap then failed to activate any APEX and init rebooted
+with bootstrap-apexd-failed.
+
+When /deckard_apex exists, the host has mounted the payload of every
+pre-installed APEX there, read-only and idmapped, at the APEX file's
+path. Bind that mount instead of creating a loop and mounting it, after
+the same signature check a pre-installed APEX gets, then verify the
+mounted image as before. Updated APEXes would need mounts of their own,
+so they fail to activate in that mode. Skip pre-allocating loop
+devices and empty dm devices, which only time out there.
+
+Change-Id: Ie87cf8e102a150a7766c75773019ab5a1a11a91c
+---
+ apexd/apexd.cpp | 63 +++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 63 insertions(+)
+
+diff --git a/apexd/apexd.cpp b/apexd/apexd.cpp
+index 3a877ac..f4527ba 100644
+--- a/apexd/apexd.cpp
++++ b/apexd/apexd.cpp
+@@ -398,6 +398,60 @@ Result<DmDevice> CreateDmLinearForPayload(const ApexFile& apex) {
+   return std::move(dev);
+ }
+ 
++// Where Deckard's host mounts the payloads of the pre-installed APEXes when
++// it runs Android in a user namespace of its own, which can neither attach
++// loop devices nor mount ext4 or erofs: the payload of /system/apex/a.apex is
++// at kHostPayloads/system/apex/a.apex, read-only and idmapped.
++constexpr const char* kHostPayloads = "/deckard_apex";
++
++bool HostMountsPayloads() {
++  struct stat st;
++  return stat(kHostPayloads, &st) == 0 && S_ISDIR(st.st_mode);
++}
++
++// Binds the host's mount of a pre-installed APEX's payload at mount_point,
++// with the signature checked as for any pre-installed APEX. Updated APEXes
++// would need a mount of their own, so they stay off.
++Result<MountedApexData> BindHostPayload(const ApexFile& apex,
++                                        const std::string& mount_point) {
++  const std::string& full_path = apex.GetPath();
++  if (!ApexFileRepository::GetInstance().IsPreInstalledApex(apex)) {
++    return Error() << "Only pre-installed APEXes activate when the host "
++                      "mounts the payloads: "
++                   << full_path;
++  }
++  if (auto verity = apex.VerifyApexVerity(apex.GetBundledPublicKey());
++      !verity.ok()) {
++    return Error() << "Failed to verify Apex Verity data for " << full_path
++                   << ": " << verity.error();
++  }
++  const std::string payload = std::string(kHostPayloads) + full_path;
++  if (mount(payload.c_str(), mount_point.c_str(), nullptr, MS_BIND,
++            nullptr) != 0) {
++    return ErrnoError() << "Binding the host's payload failed for "
++                        << full_path;
++  }
++  unsigned long flags = MS_REMOUNT | MS_BIND | MS_RDONLY | MS_NODEV |
++                        MS_NOATIME;
++  if (apex.GetManifest().nocode()) {
++    flags |= MS_NOEXEC;
++  }
++  if (mount(nullptr, mount_point.c_str(), nullptr, flags, nullptr) != 0) {
++    int saved_errno = errno;
++    umount2(mount_point.c_str(), UMOUNT_NOFOLLOW);
++    errno = saved_errno;
++    return ErrnoError() << "Remounting the host's payload failed for "
++                        << full_path;
++  }
++  if (auto status = VerifyMountedImage(apex, mount_point); !status.ok()) {
++    umount2(mount_point.c_str(), UMOUNT_NOFOLLOW);
++    return Error() << "Failed to verify " << full_path << ": "
++                   << status.error();
++  }
++  return MountedApexData(apex.GetManifest().version(), "", full_path,
++                         mount_point, "", "");
++}
++
+ Result<MountedApexData> MountPackageImpl(const ApexFile& apex,
+                                          const std::string& mount_point,
+                                          int32_t loop_id,
+@@ -450,6 +504,12 @@ Result<MountedApexData> MountPackageImpl(const ApexFile& apex,
+ 
+   const std::string& full_path = apex.GetPath();
+ 
++  if (HostMountsPayloads()) {
++    auto bound = OR_RETURN(BindHostPayload(apex, mount_point));
++    scope_guard.Disable();
++    return bound;
++  }
++
+   // Step 2. Create a block device for the payload
+ 
+   std::string block_device;
+@@ -2233,6 +2293,9 @@ Result<void> RevertActiveSessionsAndReboot(
+ 
+ void PrepareResources(size_t loop_device_cnt,
+                       const std::vector<std::string>& apex_names) {
++  if (HostMountsPayloads()) {
++    return;
++  }
+   LOG(INFO) << "Need to pre-allocate " << loop_device_cnt << " loop devices";
+   if (auto res = loop::PreAllocateLoopDevices(loop_device_cnt); !res.ok()) {
+     LOG(ERROR) << "Failed to pre-allocate loop devices : " << res.error();
+-- 
+2.55.0
+
