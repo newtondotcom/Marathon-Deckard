@@ -413,10 +413,7 @@ final class Manage {
             for (ApplicationInfo ai : managedApps(c)) {
                 if (!canHave(pm, ai, op[0]))
                     continue;
-                int mode = ops.unsafeCheckOpNoThrow(op[1], ai.uid, ai.packageName);
-                boolean granted = mode == AppOpsManager.MODE_ALLOWED || (mode == AppOpsManager.MODE_DEFAULT
-                        && op[0] != null && pm.checkPermission(op[0], ai.packageName) == PackageManager.PERMISSION_GRANTED);
-                out.put(ai, granted);
+                out.put(ai, granted(pm, ops, op, ai));
             }
             return out;
         }
@@ -469,6 +466,22 @@ final class Manage {
             default:
                 throw new IllegalArgumentException("unknown access");
         }
+    }
+
+    private static boolean granted(PackageManager pm, AppOpsManager ops, String[] op, ApplicationInfo ai) {
+        int mode = ops.unsafeCheckOpNoThrow(op[1], ai.uid, ai.packageName);
+        return mode == AppOpsManager.MODE_ALLOWED || (mode == AppOpsManager.MODE_DEFAULT
+                && op[0] != null && pm.checkPermission(op[0], ai.packageName) == PackageManager.PERMISSION_GRANTED);
+    }
+
+    /** Whether pkg has the special access an app op grants, such as install_apps. */
+    static boolean hasAccess(Context c, String kind, String pkg) throws Exception {
+        String[] op = APP_OPS.get(kind);
+        if (op == null)
+            throw new IllegalArgumentException("unknown access");
+        PackageManager pm = c.getPackageManager();
+        ApplicationInfo ai = pm.getApplicationInfo(pkg, PackageManager.ApplicationInfoFlags.of(0));
+        return granted(pm, c.getSystemService(AppOpsManager.class), op, ai);
     }
 
     private static boolean canHave(PackageManager pm, ApplicationInfo ai, String permission) throws Exception {
