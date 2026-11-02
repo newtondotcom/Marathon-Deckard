@@ -123,6 +123,7 @@ final class Manage {
             case "links": links(c, managedApp(c, pkg), m.optBoolean("enabled")); return null;
             case "battery": battery(managedApp(c, pkg).packageName, "unrestricted".equals(m.optString("mode"))); return null;
             case "stop": forceStop(c, managedApp(c, pkg).packageName); return null;
+            case "enable": enable(c, managedApp(c, pkg), m.optBoolean("enabled")); return null;
             case "cache": clearCache(c, managedApp(c, pkg).packageName); return null;
             case "clear": clearData(c, managedApp(c, pkg).packageName); return null;
             case "special": return new JSONObject().put("apps", special(c, m.optString("kind")));
@@ -149,18 +150,40 @@ final class Manage {
                 || launchable.contains(ai.packageName);
     }
 
+    /**
+     * Packages with a launcher activity. One the person disabled with its app
+     * still counts, so the app can be enabled again; one turned off on its
+     * own, as Deckard does Android's Settings, doesn't.
+     */
     private static Set<String> launchable(Context c) {
+        PackageManager pm = c.getPackageManager();
         Set<String> out = new HashSet<>();
         Intent launcher = new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER);
-        for (ResolveInfo ri : c.getPackageManager().queryIntentActivities(launcher, PackageManager.ResolveInfoFlags.of(0)))
-            out.add(ri.activityInfo.packageName);
+        for (ResolveInfo ri : pm.queryIntentActivities(launcher,
+                PackageManager.ResolveInfoFlags.of(PackageManager.MATCH_DISABLED_COMPONENTS))) {
+            ActivityInfo a = ri.activityInfo;
+            int state = pm.getComponentEnabledSetting(new ComponentName(a.packageName, a.name));
+            boolean off = state == PackageManager.COMPONENT_ENABLED_STATE_DISABLED
+                    || state == PackageManager.COMPONENT_ENABLED_STATE_DISABLED_USER
+                    || state == PackageManager.COMPONENT_ENABLED_STATE_DEFAULT && !a.enabled;
+            if (!off)
+                out.add(a.packageName);
+        }
         return out;
+    }
+
+    /** A system app Android's Settings lets the person disable: not signed as the platform. */
+    private static boolean canDisable(PackageManager pm, ApplicationInfo ai) {
+        return (ai.flags & ApplicationInfo.FLAG_SYSTEM) != 0
+                && !ai.packageName.startsWith("org.marathonos.deckard.")
+                && pm.checkSignatures("android", ai.packageName) != PackageManager.SIGNATURE_MATCH;
     }
 
     private static ApplicationInfo managedApp(Context c, String pkg) throws Exception {
         ApplicationInfo ai;
         try {
-            ai = c.getPackageManager().getApplicationInfo(pkg, PackageManager.ApplicationInfoFlags.of(0));
+            ai = c.getPackageManager().getApplicationInfo(pkg,
+                    PackageManager.ApplicationInfoFlags.of(PackageManager.MATCH_DISABLED_COMPONENTS));
         } catch (PackageManager.NameNotFoundException e) {
             throw new IllegalArgumentException("not installed");
         }
@@ -172,7 +195,8 @@ final class Manage {
     private static List<ApplicationInfo> managedApps(Context c) {
         Set<String> launchable = launchable(c);
         List<ApplicationInfo> out = new ArrayList<>();
-        for (ApplicationInfo ai : c.getPackageManager().getInstalledApplications(PackageManager.ApplicationInfoFlags.of(0))) {
+        for (ApplicationInfo ai : c.getPackageManager().getInstalledApplications(
+                PackageManager.ApplicationInfoFlags.of(PackageManager.MATCH_DISABLED_COMPONENTS))) {
             if (managed(ai, launchable))
                 out.add(ai);
         }
@@ -198,12 +222,15 @@ final class Manage {
     private static JSONObject app(Context c, ApplicationInfo ai) throws Exception {
         PackageManager pm = c.getPackageManager();
         String pkg = ai.packageName;
-        PackageInfo pi = pm.getPackageInfo(pkg, PackageManager.PackageInfoFlags.of(PackageManager.GET_PERMISSIONS));
+        PackageInfo pi = pm.getPackageInfo(pkg, PackageManager.PackageInfoFlags.of(PackageManager.GET_PERMISSIONS | PackageManager.MATCH_DISABLED_COMPONENTS));
         JSONObject r = new JSONObject().put("pkg", pkg)
                 .put("label", pm.getApplicationLabel(ai).toString())
                 .put("versionName", pi.versionName == null ? "" : pi.versionName)
                 .put("versionCode", pi.getLongVersionCode())
-                .put("system", (ai.flags & ApplicationInfo.FLAG_SYSTEM) != 0);
+                .put("system", (ai.flags & ApplicationInfo.FLAG_SYSTEM) != 0)
+                .put("updatedSystem", (ai.flags & ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) != 0)
+                .put("enabled", ai.enabled)
+                .put("canDisable", canDisable(pm, ai));
         try {
             StorageStats st = c.getSystemService(StorageStatsManager.class)
                     .queryStatsForPackage(StorageManager.UUID_DEFAULT, pkg, Process.myUserHandle());
@@ -259,7 +286,7 @@ final class Manage {
         PackageManager pm = c.getPackageManager();
         JSONArray out = new JSONArray();
         for (ApplicationInfo ai : managedApps(c)) {
-            PackageInfo pi = pm.getPackageInfo(ai.packageName, PackageManager.PackageInfoFlags.of(PackageManager.GET_PERMISSIONS));
+            PackageInfo pi = pm.getPackageInfo(ai.packageName, PackageManager.PackageInfoFlags.of(PackageManager.GET_PERMISSIONS | PackageManager.MATCH_DISABLED_COMPONENTS));
             List<String> asked = requested(c, pi, perms);
             if (asked.isEmpty())
                 continue;
@@ -318,7 +345,7 @@ final class Manage {
         if (perms.length == 0)
             throw new IllegalArgumentException("unknown permission");
         PackageManager pm = c.getPackageManager();
-        PackageInfo pi = pm.getPackageInfo(ai.packageName, PackageManager.PackageInfoFlags.of(PackageManager.GET_PERMISSIONS));
+        PackageInfo pi = pm.getPackageInfo(ai.packageName, PackageManager.PackageInfoFlags.of(PackageManager.GET_PERMISSIONS | PackageManager.MATCH_DISABLED_COMPONENTS));
         UserHandle user = Process.myUserHandle();
         for (String p : requested(c, pi, perms)) {
             if ((flags(pm, p, ai.packageName) & (FLAG_PERMISSION_SYSTEM_FIXED | FLAG_PERMISSION_POLICY_FIXED)) != 0)
@@ -366,6 +393,14 @@ final class Manage {
         Object idle = deviceIdle();
         idle.getClass().getMethod(unrestricted ? "addPowerSaveWhitelistApp" : "removePowerSaveWhitelistApp", String.class)
                 .invoke(idle, pkg);
+    }
+
+    private static void enable(Context c, ApplicationInfo ai, boolean enabled) {
+        PackageManager pm = c.getPackageManager();
+        if (!enabled && !canDisable(pm, ai))
+            throw new IllegalArgumentException("Android can't disable this app");
+        pm.setApplicationEnabledSetting(ai.packageName, enabled ? PackageManager.COMPONENT_ENABLED_STATE_DEFAULT
+                : PackageManager.COMPONENT_ENABLED_STATE_DISABLED_USER, 0);
     }
 
     private static void forceStop(Context c, String pkg) throws Exception {
@@ -486,7 +521,7 @@ final class Manage {
 
     private static boolean canHave(PackageManager pm, ApplicationInfo ai, String permission) throws Exception {
         if (permission == null) {
-            PackageInfo pi = pm.getPackageInfo(ai.packageName, PackageManager.PackageInfoFlags.of(PackageManager.GET_ACTIVITIES));
+            PackageInfo pi = pm.getPackageInfo(ai.packageName, PackageManager.PackageInfoFlags.of(PackageManager.GET_ACTIVITIES | PackageManager.MATCH_DISABLED_COMPONENTS));
             if (pi.activities != null) {
                 for (ActivityInfo a : pi.activities) {
                     if ((a.flags & FLAG_SUPPORTS_PICTURE_IN_PICTURE) != 0)
@@ -495,7 +530,7 @@ final class Manage {
             }
             return false;
         }
-        PackageInfo pi = pm.getPackageInfo(ai.packageName, PackageManager.PackageInfoFlags.of(PackageManager.GET_PERMISSIONS));
+        PackageInfo pi = pm.getPackageInfo(ai.packageName, PackageManager.PackageInfoFlags.of(PackageManager.GET_PERMISSIONS | PackageManager.MATCH_DISABLED_COMPONENTS));
         return pi.requestedPermissions != null && Arrays.asList(pi.requestedPermissions).contains(permission);
     }
 

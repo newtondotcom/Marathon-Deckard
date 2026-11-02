@@ -306,6 +306,16 @@ impl SettingsApi {
         self.change("stop", pkg, json!({}), header).await
     }
 
+    async fn set_app_enabled(
+        &self,
+        pkg: &str,
+        enabled: bool,
+        #[zbus(header)] header: Header<'_>,
+    ) -> Result<()> {
+        let args = json!({"enabled": enabled});
+        self.change("enable", pkg, args, header).await
+    }
+
     async fn clear_cache(&self, pkg: &str, #[zbus(header)] header: Header<'_>) -> Result<()> {
         self.change("cache", pkg, json!({}), header).await
     }

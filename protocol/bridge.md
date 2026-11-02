@@ -70,7 +70,7 @@ The body is HTML-escaped because the Hub advertises `body-markup`.
 | `inspect_result` | `id`, `ok`, `message`, `pkg`, `label`, `versionName`, `versionCode`, `minSdk`, `targetSdk`, `permissions`, `icon`, `installedVersionCode`, `installedVersionName`, and what it needs: `features` (required `uses-feature`), `libraries` (required `uses-library`, from its manifest), `gms` (Play services' `com.google.android.gms.version` meta-data or library), `abis` (the `lib/<abi>/` folders) | An `inspect` answered from `PackageManager.getPackageArchiveInfo`. |
 | `install_progress` | `id`, `percent` | Copying the APK into the PackageInstaller session. |
 | `install_result` | `id`, `ok`, `pkg`, `message` | An `install` finished (`PackageInstaller.EXTRA_STATUS`). Removals go to DeckardSystem (`uninstall` on `system.sock`). |
-| `packages_result` | `id`, `packages: [{pkg, label, versionName, versionCode, system, launchable}]` | Every installed package; `launchable` is whether it has a launcher activity. |
+| `packages_result` | `id`, `packages: [{pkg, label, versionName, versionCode, system, updatedSystem, enabled, launchable}]` | Every installed package, disabled ones included; `updatedSystem` is an update installed over a system app, `launchable` whether it has a launcher activity (a disabled app's counts). |
 | `device_result` | `id`, `features`, `libraries`, `abis`, `sdk`, `gms` | This phone's Android, for `device` (host to Android, `id`): `getSystemAvailableFeatures`, `getSystemSharedLibraryNames`, `Build.SUPPORTED_ABIS`, the SDK level and whether `com.google.android.gms` (microG) is installed and enabled. `Packages.DeviceProfile() → a{sv}` answers with it; the Store compares each app's needs with it (compatibility). |
 | `package_changed` | `pkg`, `change` | `installed`, `updated` or `removed`, from ACTION_PACKAGE_ADDED/REMOVED (a replace is one `updated`). |
 | `location_request` | `on`, `interval` (ms) | Android's network location provider (DeckardBridge's `NetworkLocation`) has a request (`on`) or none. Sent on every change and on connect. deckard-bridge then runs one GeoClue client (system bus, `DesktopId` `org.marathonos.Deckard`, accuracy level exact, `TimeThreshold` the interval in seconds) or stops it. `interval` is clamped to 0–24 h. |
@@ -422,7 +422,7 @@ transfers older than 30 days at start.
 | `hello` | `v` | |
 | `picked` | `id`, `ok`, `files` | The answer to a `pick`. For `open` and `capture`, `files` (`[{name, size}]`) are in `xfer/<id>/`. For `save`, one `{name}`: DeckardSystem creates the empty file there and gives the app write access. `ok` false: cancelled or failed. |
 | `focus` | `pkg` | Marathon has `waydroid.<pkg>` in front (deckard-bridge follows `org.marathonos.Shell.Navigation1.ForegroundAppChanged`; sent on every change and on connect). Android's focus normally follows the hwcomposer's `wl_keyboard.enter`; when that never came, DeckardSystem calls `setFocusedTask` on the package's top visible task, 150 ms later, unless Android already has it focused. |
-| `uninstall` | `id`, `pkg` | `Packages.UninstallPackage`: remove an app the person installed, through `PackageInstaller.uninstall` as the system uid, so with no confirmation whoever installed it. System apps and Deckard's own are refused. |
+| `uninstall` | `id`, `pkg`, `updates` | `Packages.UninstallPackage`: remove an app the person installed, through `PackageInstaller.uninstall` as the system uid, so with no confirmation whoever installed it. System apps and Deckard's own are refused. With `updates` (`Packages.UninstallUpdates`): remove the updates installed over a system app, which returns it to the image's copy; refused when there are none. |
 | `media_scan` | `paths` (at most 64) | Folders of Marathon's shared storage, as Android sees them (`/storage/emulated/0/<Documents, Download, Pictures, Music, Movies or DCIM>[/…]`), that changed on the host. DeckardSystem calls `MediaStore.scanFile` on each; other paths are ignored. |
 | `reclaim` | `id`, `count` (1–8), `reason` | Memory is short: end up to `count` cached app processes, least recently used first. Only processes ActivityManager ranks `IMPORTANCE_CACHED`, with an app uid (10000 and up) and not Deckard's own, are candidates; each goes through `killPids` without `secure`, which re-checks its adj and spares one that came forward. deckard-bridge sends it when the container's `memory.events` `high` or `max` counter rises, on a PSI trigger on the container's `memory.pressure` (`some 1000000 10000000`, 10 % of 10 s) or the phone's `/proc/pressure/memory` (`some 2000000 10000000`, the shell's avg10 High level), with `count` 2, at most once every 2 s, or 10 s after a reclaim that found nothing. |
 
@@ -538,7 +538,9 @@ How Marathon's Settings shows and changes Android apps. deckard-bridge exports
 `org.marathonos.Deckard1` on `/org/marathonos/Deckard` (bus name
 `org.marathonos.Deckard`, session bus); the install methods live beside it as
 `org.marathonos.Deckard1.Packages`. Settings lists apps with
-`Packages.ListPackages` and removes them with `Packages.UninstallPackage`.
+`Packages.ListPackages` and removes them with `Packages.UninstallPackage`, or a
+system app's updates with `Packages.UninstallUpdates`; system apps are never
+uninstalled.
 
 ### Callers
 
@@ -560,13 +562,14 @@ failure in Android is `org.marathonos.Deckard1.Error.Failed` with its message.
 | `Start()`, `Stop()`, `Restart()` | `StartUnit`/`StopUnit`/`RestartUnit` of `marathon-waydroid.service` |
 | `SetStartAtLogin(b)` | Kept in `~/.local/state/deckard/settings.json`. Unset, it is on when Waydroid has a desktop entry without `NoDisplay=true` (an app the person installed). deckard-bridge starts the session once per login when it is on. |
 | `AppIcon(s pkg) → s` | A `data:image/png` URI of `<waydroid data>/icons/<pkg>.png` or deckard-bridge's notification icon, decoded and re-encoded at most 192 px; `""` if none |
-| `GetApp(s pkg) → a{sv}` | `pkg`, `label`, `versionName`, `versionCode`, `appBytes`, `dataBytes` (with cache), `cacheBytes`, `notifications`, `links`, `domains` (as), `battery` (`unrestricted`/`optimized`), `permissions` (av of `{name, granted, fixed}`, `name` a Marathon permission; granted if any of its Android permissions is, fixed only if all are) |
+| `GetApp(s pkg) → a{sv}` | `pkg`, `label`, `versionName`, `versionCode`, `system`, `updatedSystem`, `enabled`, `canDisable` (a system app not signed as the platform, which Android's Settings lets the person disable), `appBytes`, `dataBytes` (with cache), `cacheBytes`, `notifications`, `links`, `domains` (as), `battery` (`unrestricted`/`optimized`), `permissions` (av of `{name, granted, fixed}`, `name` a Marathon permission; granted if any of its Android permissions is, fixed only if all are) |
 | `SetPermission(s pkg, s permission, b granted)` | `permission` a Marathon permission name: grants or revokes its Android runtime permissions that the app asks for, marked user-set (the app may ask again); `notifications` sets Android's notification switch |
 | `GetPermissionApps(s permission) → aa{sv}` | The person's apps that ask for it: `{pkg, label, granted, fixed}` (Settings' App permissions) |
 | `SetNotifications(s pkg, b)` | Android's per-app setting |
 | `SetOpenLinks(s pkg, b)` | Opening the app's verified links in it |
 | `SetBattery(s pkg, s mode)` | `unrestricted` adds it to the idle allowlist |
 | `ForceStop(s pkg)`, `ClearCache(s pkg)`, `ClearData(s pkg)` | |
+| `SetAppEnabled(s pkg, b enabled)` | Android's Disable and Enable; disabling refuses an app without `canDisable` |
 | `GetSpecialAccess(s kind) → aa{sv}` | The person's apps that can have it: `{pkg, label, granted}` |
 | `SetSpecialAccess(s kind, s pkg, b granted)` | |
 | `GetGoogleServices() → a{sv}` | microG (docs/microg.md): `installed`, `enabled`, `push` (microG's cloud messaging; false while microG is off), `accounts` (as, the Google accounts' names, at most 10) |
@@ -626,7 +629,7 @@ runs as Android's system uid, so Android's own checks admit them
 
 | `t` | Fields | |
 |---|---|---|
-| `manage` (host to Android) | `id`, `op`, then per op | `info`; `app`, `stop`, `cache`, `clear` with `pkg`; `perm` with `pkg`, `permissions` (Android names), `granted`; `perm_apps` with `permissions`; `notif_apps`; `notifications`, `links` with `pkg`, `enabled`; `battery` with `pkg`, `mode`; `special` with `kind`; `special_set` with `kind`, `pkg`, `granted`; `gms`; `gms_set` with `key`, `enabled`; `gms_open` with `page` |
+| `manage` (host to Android) | `id`, `op`, then per op | `info`; `app`, `stop`, `cache`, `clear` with `pkg`; `enable` with `pkg`, `enabled`; `perm` with `pkg`, `permissions` (Android names), `granted`; `perm_apps` with `permissions`; `notif_apps`; `notifications`, `links` with `pkg`, `enabled`; `battery` with `pkg`, `mode`; `special` with `kind`; `special_set` with `kind`, `pkg`, `granted`; `gms`; `gms_set` with `key`, `enabled`; `gms_open` with `page` |
 | `managed` (Android to host) | `id`, `ok`, `error` or the answer | `info`: `release`, `sdk`. `app`: `GetApp`'s fields, with `perms` (`{name, granted, fixed}` for each runtime permission the app asks for, by Android name) in place of `permissions`. `special`, `perm_apps`, `notif_apps`: `apps`. `gms`: `installed`, `enabled`, `push`, `accounts`. |
 
 DeckardSystem acts only on the apps Android's Settings lists as the

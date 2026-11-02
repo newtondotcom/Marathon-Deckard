@@ -203,17 +203,30 @@ final class Installer {
     private JSONObject packages(String id) throws JSONException {
         PackageManager pm = mContext.getPackageManager();
         JSONArray list = new JSONArray();
-        for (PackageInfo info : pm.getInstalledPackages(PackageManager.PackageInfoFlags.of(0))) {
-            if (info.applicationInfo == null)
+        for (PackageInfo info : pm.getInstalledPackages(
+                PackageManager.PackageInfoFlags.of(PackageManager.MATCH_DISABLED_COMPONENTS))) {
+            ApplicationInfo ai = info.applicationInfo;
+            if (ai == null)
                 continue;
             list.put(new JSONObject().put("pkg", info.packageName)
-                    .put("system", (info.applicationInfo.flags & ApplicationInfo.FLAG_SYSTEM) != 0)
-                    .put("launchable", pm.getLaunchIntentForPackage(info.packageName) != null)
-                    .put("label", pm.getApplicationLabel(info.applicationInfo).toString())
+                    .put("system", (ai.flags & ApplicationInfo.FLAG_SYSTEM) != 0)
+                    .put("updatedSystem", (ai.flags & ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) != 0)
+                    .put("enabled", ai.enabled)
+                    .put("launchable", launchable(pm, ai))
+                    .put("label", pm.getApplicationLabel(ai).toString())
                     .put("versionName", info.versionName == null ? "" : info.versionName)
                     .put("versionCode", info.getLongVersionCode()));
         }
         return new JSONObject().put("t", "packages_result").put("id", id).put("packages", list);
+    }
+
+    /** Whether the app has a launcher activity; a disabled app's still counts, so it can be enabled again. */
+    private static boolean launchable(PackageManager pm, ApplicationInfo ai) {
+        if (ai.enabled)
+            return pm.getLaunchIntentForPackage(ai.packageName) != null;
+        Intent launcher = new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER).setPackage(ai.packageName);
+        return !pm.queryIntentActivities(launcher,
+                PackageManager.ResolveInfoFlags.of(PackageManager.MATCH_DISABLED_COMPONENTS)).isEmpty();
     }
 
     private void progress(String id, int percent) {
