@@ -121,12 +121,7 @@ pub fn host_devices() -> Result<BTreeSet<String>> {
             paths.insert(path.to_owned());
         }
     }
-    for (dir, prefix) in [
-        ("/dev", "fb"),
-        ("/dev/graphics", "fb"),
-        ("/dev", "video"),
-        ("/dev/dma_heap", ""),
-    ] {
+    for (dir, prefix) in [("/dev", "video"), ("/dev/dma_heap", "")] {
         let Ok(entries) = fs::read_dir(dir) else {
             continue;
         };
@@ -283,12 +278,7 @@ impl Init<'_> {
             match (line, optional) {
                 ("@render", _) => entries.extend(self.host.render_node.as_deref().map(file)),
                 ("@devices", _) => {
-                    for prefix in [
-                        "/dev/fb",
-                        "/dev/graphics/fb",
-                        "/dev/video",
-                        "/dev/dma_heap/",
-                    ] {
+                    for prefix in ["/dev/video", "/dev/dma_heap/"] {
                         let under = devices.iter().filter(|path| path.starts_with(prefix));
                         entries.extend(under.map(|path| file(path)));
                     }
@@ -752,13 +742,7 @@ mod tests {
         }
 
         fn init(&self, images: Images) -> Result<Init<'_>> {
-            let devices = [
-                "/dev/zero",
-                "/dev/fuse",
-                "/dev/char",
-                "/dev/fb0",
-                "/dev/net/tun",
-            ];
+            let devices = ["/dev/zero", "/dev/fuse", "/dev/char", "/dev/net/tun"];
             Ok(Init {
                 instance: &self.instance,
                 images,
@@ -836,7 +820,6 @@ mod tests {
             format!("/dev/fuse dev/fuse {file}"),
             "/dev/char dev/char none bind,create=dir,optional".to_owned(),
             format!("/dev/dri/renderD128 dev/dri/renderD128 {file}"),
-            format!("/dev/fb0 dev/fb0 {file}"),
             format!("/dev/binder dev/binder {file}"),
             format!("/dev/vndbinder dev/vndbinder {file}"),
             format!("/dev/hwbinder dev/hwbinder {file}"),

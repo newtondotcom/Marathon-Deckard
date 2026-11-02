@@ -184,7 +184,8 @@ fn link_nodes(binderfs: &Path, dev: &Path, names: &[&str]) -> Result<()> {
 }
 
 /// Opens the host device nodes Android uses to everyone, as upstream does
-/// (mode 0777): GPU, display, video, DMA heaps and sync nodes.
+/// (mode 0777): GPU, video, DMA heaps and sync nodes. Not the framebuffer,
+/// which would let any host process read or paint the screen.
 ///
 /// # Errors
 /// A present node cannot be listed or changed.
@@ -196,16 +197,10 @@ pub fn open_device_access(dev: &Path, debug_sync: &Path) -> Result<()> {
     nodes.push(debug_sync.to_owned());
     for (directory, prefix) in [
         (dev.join("dri"), "renderD"),
-        (dev.to_owned(), "fb"),
         (dev.to_owned(), "video"),
         (dev.join("dma_heap"), ""),
     ] {
         nodes.extend(matching(&directory, prefix)?);
-    }
-    let graphics = dev.join("graphics");
-    if graphics.is_dir() {
-        nodes.extend(matching(&graphics, "")?);
-        nodes.push(graphics);
     }
     for node in nodes {
         files::found(fs::set_permissions(&node, Permissions::from_mode(0o777)))?;
@@ -348,14 +343,9 @@ mod tests {
         for path in ["dri", "dma_heap", "graphics"] {
             fs::create_dir(dev.path().join(path))?;
         }
-        let opened = [
-            "dri/renderD128",
-            "dma_heap/system",
-            "graphics/fb0",
-            "fb0",
-            "video19",
-        ];
-        let created = [opened.as_slice(), &["dri/card0", "null"]].concat();
+        let opened = ["dri/renderD128", "dma_heap/system", "video19"];
+        let closed = ["dri/card0", "null", "fb0", "graphics/fb0"];
+        let created = [opened.as_slice(), &closed].concat();
         for path in created {
             fs::write(dev.path().join(path), "")?;
             fs::set_permissions(dev.path().join(path), fs::Permissions::from_mode(0o600))?;
@@ -367,8 +357,9 @@ mod tests {
         for path in opened {
             assert_eq!(mode(path)?, 0o777, "{path}");
         }
-        assert_eq!(mode("dri/card0")?, 0o600);
-        assert_eq!(mode("null")?, 0o600);
+        for path in closed {
+            assert_eq!(mode(path)?, 0o600, "{path}");
+        }
         Ok(())
     }
 
