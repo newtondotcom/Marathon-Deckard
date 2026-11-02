@@ -126,6 +126,24 @@ the dialog's settings link. MarathonGrantView follows the link once (the
 same Marathon prompt as above). If Android asks again, it answers "keep
 while using".
 
+### Android's notification prompt for older apps
+
+For an app targeting API 32 or lower, Android opens the notification
+question itself when the app starts (`REQUEST_PERMISSIONS_FOR_OTHER`), as
+a task overlay in the app's task. If the app then asks for permissions,
+upstream folds the app's GrantPermissionsActivity into the system one, and
+it waits paused beneath the overlay; the app's launch transition waits for
+it to resume, which stalled F-Droid's first launch for 5 s. Deckard's
+PermissionController reverses the merge (image/lineage-23.2, Permission
+patch 0003):
+- the app's activity leads and takes the system dialog's permissions,
+  still marked system-requested;
+- the system dialog, which owes no result, finishes;
+- its Marathon prompt is handed to the leader, which keeps it when it asks
+  the same question (0004), so the notification question is asked once.
+
+Upstream's merge stays when the system dialog already has followers.
+
 ## The shell
 
 `org.marathonos.Shell.Permissions1` gains two methods. Only a declared
@@ -212,4 +230,9 @@ isn't a privacy switch. So there is nothing for the prompt to defer to yet.
     `READ_MEDIA_VISUAL_USER_SELECTED` was granted (`USER_SET`) and the app's
     MediaStore query returned only that photo. The picker needs Android's
     emulated storage (`/dev/fuse` in the container).
+  - F-Droid (API 30) first launches with 0003: Android still starts two
+    GrantPermissionsActivities; the system one finishes when F-Droid's own
+    request arrives, and F-Droid's resumes as the only leader 110 ms after
+    it was created. Launches took 0.9 s or less to the leader's first
+    frame.
 - **Still Android's dialog**: anything Marathon can't name.
