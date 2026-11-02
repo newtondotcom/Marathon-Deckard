@@ -28,11 +28,12 @@ app: requestPermissions([CAMERA])
 
 ## Choosing the hook
 
-Android 13 resolves a permission request with
+Android resolves a permission request with
 `PackageManager.buildRequestPermissionsIntent`, which pins the intent to the
-permission controller package. Checked against this image's code
+permission controller package. Checked against Android 13's code
 (PermissionController TQ3A.230901.001 and `services.jar` taken from the
-device and decompiled):
+device and decompiled). Android 16's source keeps the chosen hook; the
+rejected options were not rechecked there:
 
 | Option | Verdict |
 |---|---|
@@ -54,32 +55,15 @@ phones, TV, Wear and cars. Deckard's PermissionController creates
 `MarathonGrantView` instead of the phone handler. So every Android rule still
 holds; only the drawing moved.
 
-The patch is one constructor call in `GrantPermissionsActivity.onCreate`
-plus one added class (`classes2.dex`). Two facts made it cheap:
-
-- **The APEX is flattened.** `/system/apex/com.android.permission/` is a
-  directory, so Waydroid's overlay can replace
-  `priv-app/PermissionController@TQ3A.230901.001/PermissionController.apk`
-  without rebuilding an APEX.
-- **PermissionController is already signed with the platform key.** Its
-  certificate SHA-256 is `c8a2e9bc…92ab8`, the same as AOSP's platform test
-  key. The patched APK is signed again with that key, so its signature
-  doesn't change: no "signature changed" path in PackageManager, the same
-  permissions, the same data. (PMS would accept a changed signature for a
-  `/system` package anyway; `ReconcilePackageUtils` logs "System package …
-  signature changed; retaining data".) chrome-and-theme.md says it isn't
-  platform-signed; on this image it is.
-
-`image/tools/patch-permissioncontroller.sh <stock apk> <out>` builds it. It
-refuses any APK whose SHA-256 isn't the stock one
-(`8d9d4f73…aaed13`), and the smali edit fails unless it finds exactly one
-handheld handler construction. Steps: baksmali (2.5.2) the stock
-`classes.dex`, swap the constructor, smali it back, add `MarathonGrantView`
-built against stubs of PermissionController's classes, zipalign, apksigner.
-`deckard-overlay-sync` installs the APK only while `waydroid.cfg` has
-`system_datetime = 1790477549`, the image it was made from. A newer
-Waydroid image gets Android's own PermissionController back, and its
-dialog, until the patch is redone for it.
+Deckard's image builds PermissionController from source (LineageOS 23.2,
+Android 16; its APEXes are not flattened, so an APK swap cannot work). The
+patch is one constructor call in `GrantPermissionsActivity.onCreate` plus
+`MarathonGrantView`, written against Android 16's
+`GrantPermissionsViewHandler` (the rationale message, `setResultListener`,
+16 buttons). It lives in Marathon-Deckard's `image/lineage-23.2` branch as
+`image/build/patches/packages_modules_Permission`, applied by
+`image/build/scripts/apply-patches.sh` and shipped in the image's
+`com.android.permission` APEX.
 
 ## Mapping a question to Marathon's prompt
 
@@ -87,12 +71,13 @@ dialog, until the patch is redone for it.
 
 | Android | `perm_ask` | Marathon's prompt |
 |---|---|---|
-| The group's platform permissions the app asks for (`Utils.getPlatformPermissionNamesOfGroup` ∩ the manifest) | `perms` | deckard-bridge names them with `PermissionMap::marathon` (the table Settings uses); the shell takes the label and description from Marathon's vocabulary. Permissions that map to no name, or to two, go back to Android's dialog. |
+| The group's platform permissions the app asks for (`Utils.getPlatformPermissionNamesOfGroup` ∩ the manifest) | `perms` | deckard-bridge names them with `contract::marathon_permission` (the table Settings uses); the shell takes the label and description from Marathon's vocabulary. Android permissions with no Marathon name are left out: Android 16's groups also hold `READ_MEDIA_VISUAL_USER_SELECTED` (implicit for every app asking for photos), `ACCESS_MEDIA_LOCATION`, `RANGING`, `ACCESS_LOCAL_NETWORK`, `READ_CELL_BROADCASTS` and health permissions. A request with no named permission, two names, or a non-platform permission goes back to Android's dialog. |
 | `ALLOW_ONE_TIME` offered (camera, microphone, location) | `once` | An "Only this time" switch |
 | Location accuracy radio group (fine requested with coarse) | `accuracy: choice`, `preciseDefault` | A "Precise location" switch, on by Android's default |
 | Coarse only | `accuracy: approximate` | "…your approximate location" |
 | Fine only, coarse granted (upgrade) | `kind: precise` | "…wants your precise location" |
 | "All the time" (see below) | `kind: background` | "…wants to use your location all the time, even when you aren't using it" |
+| Photos and videos with Android 14's picker (apps targeting API 34+, or declaring `READ_MEDIA_VISUAL_USER_SELECTED`) | none | Android's dialog: Marathon's prompt has no "select photos" choice. Older apps get the plain question and Marathon's storage prompt. |
 
 Marathon's design system allows two actions per dialog, so Android's extra
 buttons become switches: Deny and Allow stay the prompt's only actions.
@@ -105,7 +90,7 @@ The answer maps back to the button Android offered:
 | Allow, only this time | `GRANTED_ONE_TIME`: Android's one-time session; the grant goes when the app has been in the background for a while |
 | Deny | `DENIED_DO_NOT_ASK_AGAIN` when Android offered "don't allow" in its second-time form (the group was denied before, `USER_SET`), else `DENIED`. Android 11+ semantics: the second denial is final (`USER_FIXED`) and the app's `shouldShowRequestPermissionRationale` follows. |
 | Dismissed (back, Home, another app in front, the shell gone) | `CANCELED`, as Android's back: no flags change and the app may ask again |
-| deckard-bridge can't ask (no shell method, refused, unknown permission, too many waiting) | Android's own dialog is shown, restyled by DeckardPermissionControllerRes |
+| deckard-bridge can't ask (no shell method, refused, unknown permission, too many waiting) | Android's own dialog is shown. DeckardPermissionControllerRes restyles Android 13's Material 3 layout; Android 16 draws its expressive layout, which the overlay doesn't reach yet. |
 
 Nothing is granted without the person: every result comes from their
 answer, and every failure falls back to Android asking them.
@@ -190,35 +175,34 @@ isn't a privacy switch. So there is nothing for the prompt to defer to yet.
   shell. With no shell, Android asks. Android's cancels and a lost channel
   reach the shell. The waiting list is bounded and a repeated id is
   ignored. All 17 deckard-bridge tests pass.
-- **overlay sync**: the PermissionController APK is installed only for
-  `system_datetime 1790477549` (`host/deckard-overlay-sync/tests/overlay_sync.rs`).
-- **Patch**: the patched `classes.dex` disassembles to the intended
-  constructor; `classes2.dex` holds `MarathonGrantView`; apksigner verifies
-  the platform signature.
-## Still to check on the device
-
-1. ART accepts the reassembled `classes.dex`. Look in logcat for
-   `PermissionController` verify errors after the session restarts, and
-   check that `dumpsys package com.android.permissioncontroller` shows the
-   overlay APK.
-2. PermissionController reaches DeckardSystem's provider. Without it,
-   "Marathon can't ask" appears in logcat and Android's dialog shows
-   instead.
-3. Real apps, with screenshots: Catima's camera (only this time, deny
-   twice for "don't ask again"), FOSS Browser's location (precise switch,
-   then "all the time" through BackgroundAccess), Feeder's notifications
-   (POST_NOTIFICATIONS).
-4. Dismissing a prompt (back, Home) gives CANCELED, and the flags stay
-   unchanged.
-5. With deckard-bridge stopped, Android's dialog and permission page are shown.
-
-## Android 16
-
-Android 16's APEXes are not flattened, so the APK swap above cannot work on
-LineageOS 23.2. Deckard's 23.2 image carries the hook in source instead:
-`MarathonGrantView` (adapted to Android 16's view handler interface, which
-adds the rationale message and `setResultListener`) is added to
-PermissionController, and GrantPermissionsActivity creates it in place of
-the handheld handler (Marathon-Deckard branch `image/lineage-23.2`,
-`image/build/patches/packages_modules_Permission`). Requests that need the
-photo picker get Android's dialog.
+- **deckard-bridge**, again for Android 16: a photos request carrying
+  `READ_MEDIA_VISUAL_USER_SELECTED` and `ACCESS_MEDIA_LOCATION` becomes the
+  storage prompt; a request with only unnamed members, or with a
+  non-platform permission, goes back to Android (`tests/permissions.rs`).
+- **On the Zinwa Q25**, LineageOS 23.2 image `system_datetime 1793176546`
+  (PermissionController BP4A.251205.006, from the source patch), with a test
+  app targeting API 33 that requests on demand. The results come from
+  `dumpsys package` and `appops get`:
+  - Camera, "Only this time": `granted`, `USER_SET|ONE_TIME`.
+  - Camera, Deny: `USER_SET`, and the rationale is shown. A second Deny
+    gives `USER_FIXED` with no rationale. A third request returns denied at
+    once, with no prompt.
+  - Location with "Precise location" off, then Allow: only
+    `ACCESS_COARSE_LOCATION`, appop `COARSE_LOCATION: foreground`. Asking
+    for fine again gives "wants your precise location"; Allow gives
+    `FINE_LOCATION: foreground`.
+  - Background location: Marathon's "all the time" prompt (BackgroundAccess).
+    Deny leaves it revoked and `USER_SET`.
+  - Microphone, Allow: `RECORD_AUDIO: foreground` (while in use).
+  - Notifications, Allow: `POST_NOTIFICATIONS` granted, `USER_SET`.
+  - Contacts dismissed with Back: the app gets denied and no flags change.
+  - Photos and videos: before the deckard-bridge fix above, Android's dialog
+    ("left to Android: … 4 permissions"). After it, Marathon's "Your files"
+    prompt; Allow grants `READ_MEDIA_IMAGES` and `READ_MEDIA_VIDEO`
+    (`USER_SET`), and Android grants the implicit
+    `READ_MEDIA_VISUAL_USER_SELECTED` with them.
+  - The first screenshots after each request show the app, then Marathon's
+    prompt; Android's dialog never appears.
+- **Still Android's dialog**: photos and videos for apps targeting API 34+
+  (Android 14's "Allow limited access" picker), and anything Marathon
+  can't name.
