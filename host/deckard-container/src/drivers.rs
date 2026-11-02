@@ -184,7 +184,8 @@ fn link_nodes(binderfs: &Path, dev: &Path, names: &[&str]) -> Result<()> {
 }
 
 /// Opens the host device nodes Android uses to everyone, as upstream does
-/// (mode 0777): GPU, display, video, DMA heaps and sync nodes.
+/// (mode 0777): GPU, display, DMA heaps and sync nodes. Not V4L2 nodes: a
+/// camera's would let any host process watch through it.
 ///
 /// # Errors
 /// A present node cannot be listed or changed.
@@ -197,7 +198,6 @@ pub fn open_device_access(dev: &Path, debug_sync: &Path) -> Result<()> {
     for (directory, prefix) in [
         (dev.join("dri"), "renderD"),
         (dev.to_owned(), "fb"),
-        (dev.to_owned(), "video"),
         (dev.join("dma_heap"), ""),
     ] {
         nodes.extend(matching(&directory, prefix)?);
@@ -348,14 +348,8 @@ mod tests {
         for path in ["dri", "dma_heap", "graphics"] {
             fs::create_dir(dev.path().join(path))?;
         }
-        let opened = [
-            "dri/renderD128",
-            "dma_heap/system",
-            "graphics/fb0",
-            "fb0",
-            "video19",
-        ];
-        let created = [opened.as_slice(), &["dri/card0", "null"]].concat();
+        let opened = ["dri/renderD128", "dma_heap/system", "graphics/fb0", "fb0"];
+        let created = [opened.as_slice(), &["dri/card0", "null", "video19"]].concat();
         for path in created {
             fs::write(dev.path().join(path), "")?;
             fs::set_permissions(dev.path().join(path), fs::Permissions::from_mode(0o600))?;
@@ -369,6 +363,7 @@ mod tests {
         }
         assert_eq!(mode("dri/card0")?, 0o600);
         assert_eq!(mode("null")?, 0o600);
+        assert_eq!(mode("video19")?, 0o600);
         Ok(())
     }
 

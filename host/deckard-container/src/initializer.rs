@@ -9,6 +9,7 @@ use std::env;
 use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions, Permissions};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -134,6 +135,7 @@ pub fn host_devices() -> Result<BTreeSet<String>> {
             let entry = entry?;
             if entry.file_name().to_string_lossy().starts_with(prefix)
                 && entry.file_type()?.is_char_device()
+                && (prefix != "video" || memory_to_memory(&entry.path()))
             {
                 let path = entry.path().to_string_lossy().into_owned();
                 validate_token(&path)?;
@@ -142,6 +144,56 @@ pub fn host_devices() -> Result<BTreeSet<String>> {
         }
     }
     Ok(paths)
+}
+
+/// Whether the V4L2 node at `path` is memory-to-memory (a codec). Capture
+/// nodes stay the host's: Android gets cameras from deckard-camera
+/// (docs/camera.md).
+#[allow(
+    unsafe_code,
+    reason = "VIDIOC_QUERYCAP has no safe wrapper in rustix or nix"
+)]
+fn memory_to_memory(path: &Path) -> bool {
+    #[repr(C)]
+    struct Capability {
+        driver: [u8; 16],
+        card: [u8; 32],
+        bus_info: [u8; 32],
+        version: u32,
+        capabilities: u32,
+        device_caps: u32,
+        reserved: [u32; 3],
+    }
+    const VIDIOC_QUERYCAP: u32 = 0x8068_5600;
+    const DEVICE_CAPS: u32 = 0x8000_0000;
+    const M2M: u32 = 0x8000 | 0x4000;
+    let Ok(node) = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+    else {
+        return false;
+    };
+    let mut capability = Capability {
+        driver: [0; 16],
+        card: [0; 32],
+        bus_info: [0; 32],
+        version: 0,
+        capabilities: 0,
+        device_caps: 0,
+        reserved: [0; 3],
+    };
+    // SAFETY: VIDIOC_QUERYCAP writes one struct v4l2_capability, which
+    // `capability` is, laid out as the kernel's.
+    let queried =
+        unsafe { libc::ioctl(node.as_raw_fd(), VIDIOC_QUERYCAP as _, &raw mut capability) } == 0;
+    let caps = if capability.capabilities & DEVICE_CAPS == 0 {
+        capability.capabilities
+    } else {
+        capability.device_caps
+    };
+    queried && caps & M2M != 0
 }
 
 /// The host facts the rendered files depend on.
