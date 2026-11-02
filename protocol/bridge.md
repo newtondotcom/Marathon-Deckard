@@ -517,16 +517,18 @@ system channel:
 
 | `t` | Direction | Fields | Meaning |
 |---|---|---|---|
-| `perm_ask` | Android to host | `id` (16 hex digits, DeckardSystem's), `pkg`, `perms` (the Android permissions asked for, 1 to 16), `kind` (`foreground`, `background`, `precise`), `once` (offer "only this time"), `accuracy` (`""`, `choice`, `approximate`), `preciseDefault` | One question. deckard-bridge names `perms` with `contract::marathon_permission`; Android permissions without a name are skipped, and the rest must share one name. A repeated `id` is ignored. |
-| `perm_answer` | host to Android | `id`, `answer` (`allow`, `once`, `deny`, `cancel`, `unsupported`), `precise` | The person's answer. `cancel`: dismissed, as Android's back. `unsupported`: Marathon can't ask (a bad or unnamed request, more than 8 waiting, no shell or an older one); Android shows its own dialog. |
+| `perm_ask` | Android to host | `id` (16 hex digits, DeckardSystem's), `pkg`, `perms` (the Android permissions asked for, 1 to 16), `kind` (`foreground`, `background`, `precise`), `once` (offer "only this time"), `accuracy` (`""`, `choice`, `approximate`), `preciseDefault`, `limited` (offer "only the photos I pick") | One question. deckard-bridge names `perms` with `contract::marathon_permission`; Android permissions without a name are skipped, and the rest must share one name. A repeated `id` is ignored. |
+| `perm_answer` | host to Android | `id`, `answer` (`allow`, `once`, `deny`, `cancel`, `unsupported`), `precise`, `limited` (the person chose only the photos they pick) | The person's answer. `cancel`: dismissed, as Android's back. `unsupported`: Marathon can't ask (a bad or unnamed request, more than 8 waiting, no shell or an older one); Android shows its own dialog. |
 | `perm_cancel` | Android to host | `id` | GrantPermissionsActivity went away; deckard-bridge withdraws the prompt and sends no answer. |
 
 deckard-bridge asks the shell with `org.marathonos.Shell` `/org/marathonos/Shell/Permissions`
 `org.marathonos.Shell.Permissions1.PromptAndroid(s appId, s permission,
-a{sv} options) → a{sv}`, where `appId` is `waydroid.<pkg>`, `permission` is
+a{sv} options) → a{sv}`, where `appId` is `deckard.<pkg>`, `permission` is
 the Marathon name and `options` are `request` (= `id`), `kind`, `once`,
-`accuracy` and `preciseDefault`. The reply waits for the person (deckard-bridge
-waits up to 10 minutes, then answers `cancel`) and is `{answer, precise}`.
+`accuracy`, `preciseDefault` and `limited`. The reply waits for the person
+(deckard-bridge waits up to 10 minutes, then answers `cancel`) and is
+`{answer, precise, limited}`. A shell without `limited` ignores the option and
+leaves it out of the reply, which reads as "all".
 `CancelAndroidPrompt(s request)` withdraws one. Both need the caller to be a
 declared session service with `android-permissions`. When the system
 channel drops, deckard-bridge withdraws every waiting prompt; DeckardSystem then

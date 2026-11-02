@@ -69,8 +69,8 @@ public final class BackgroundAccess extends Activity {
             return;
         }
         mId = PermissionPrompts.newId();
-        if (!PermissionPrompts.ask(mId, mPkg, background, "background", false, "", false,
-                (answer, precise) -> runOnUiThread(() -> answered(background, answer)))) {
+        if (!PermissionPrompts.ask(mId, mPkg, background, "background", false, "", false, false,
+                (answer, precise, limited) -> runOnUiThread(() -> answered(background, answer)))) {
             mId = null;
             stockPage();
         }

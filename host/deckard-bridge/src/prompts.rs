@@ -39,6 +39,7 @@ struct Ask<'a> {
     accuracy: &'a str,
     once: bool,
     precise_default: bool,
+    limited: bool,
     perms: Option<Vec<&'a str>>,
 }
 
@@ -78,6 +79,7 @@ pub fn prompt(ask: &Map<String, Value>) -> Option<(String, &'static str, Variant
         ("once".to_owned(), ask.once.into()),
         ("accuracy".to_owned(), str(ask.accuracy)),
         ("preciseDefault".to_owned(), ask.precise_default.into()),
+        ("limited".to_owned(), ask.limited.into()),
     ]);
     Some((keel::app_id(ask.pkg), name?, options))
 }
@@ -150,7 +152,7 @@ impl PermissionPrompts {
             let pkg = json::text(message, "pkg", 255);
             let count = json::array(message, "perms").len();
             eprintln!("deckard-bridge: left to Android: {pkg} {count} permissions");
-            self.answer(id, "unsupported", false);
+            self.answer(id, "unsupported", false, false);
             return;
         };
         let this = self.clone();
@@ -176,14 +178,15 @@ impl PermissionPrompts {
                 }
                 waiting.ids.remove(&id);
             }
-            let (answer, precise) = match reply {
+            let (answer, precise, limited) = match reply {
                 Some(Ok(reply)) => {
                     let get = |key: &str| reply.get(key).map(|value| &**value);
+                    let flag = |key: &str| get(key).and_then(|v| v.downcast_ref::<bool>().ok());
                     let answer = get("answer").and_then(|v| v.downcast_ref::<&str>().ok());
-                    let precise = get("precise").and_then(|v| v.downcast_ref::<bool>().ok());
                     let answer = ANSWERS.into_iter().find(|a| Some(*a) == answer);
                     let answer = answer.unwrap_or("cancel");
-                    (answer, precise.unwrap_or(false))
+                    let precise = flag("precise").unwrap_or(false);
+                    (answer, precise, flag("limited").unwrap_or(false))
                 }
                 Some(Err(error)) => {
                     eprintln!("deckard-bridge: PromptAndroid: {error}");
@@ -193,11 +196,15 @@ impl PermissionPrompts {
                         }
                         _ => false,
                     };
-                    (if no_reply { "cancel" } else { "unsupported" }, false)
+                    (
+                        if no_reply { "cancel" } else { "unsupported" },
+                        false,
+                        false,
+                    )
                 }
-                None => ("cancel", false),
+                None => ("cancel", false, false),
             };
-            this.answer(&id, answer, precise);
+            this.answer(&id, answer, precise, limited);
         };
         self.bus.spawn("permission-prompt", ask).detach();
     }
@@ -210,8 +217,9 @@ impl PermissionPrompts {
         }
     }
 
-    fn answer(&self, id: &str, answer: &str, precise: bool) {
-        let message = json!({"t": "perm_answer", "id": id, "answer": answer, "precise": precise});
+    fn answer(&self, id: &str, answer: &str, precise: bool, limited: bool) {
+        let message = json!({"t": "perm_answer", "id": id, "answer": answer, "precise": precise,
+            "limited": limited});
         (self.send)(crate::object(message));
     }
 
