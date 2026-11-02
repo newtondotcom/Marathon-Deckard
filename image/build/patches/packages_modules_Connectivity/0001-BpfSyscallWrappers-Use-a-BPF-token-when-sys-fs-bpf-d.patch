@@ -1,0 +1,78 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: patrickjquinn <patrick.jm.quinn@gmail.com>
+Date: Mon, 2 Nov 2026 17:58:22 +0000
+Subject: [PATCH] BpfSyscallWrappers: Use a BPF token when /sys/fs/bpf
+ delegates one
+
+Deckard can run Android in a user namespace of its own. There bpf()
+refuses to create maps or load programs or BTF without a BPF token, and
+bpfloader's failure reboots Android (reboot_on_failure). Deckard's host
+mounts Android's /sys/fs/bpf with delegation for the networking program,
+map and attach types netd loads.
+
+Create a token from /sys/fs/bpf once per process, and pass it to
+BPF_MAP_CREATE, BPF_PROG_LOAD and BPF_BTF_LOAD. Where /sys/fs/bpf
+delegates nothing, as outside a user namespace, no token is made and
+nothing changes.
+---
+ .../include/BpfSyscallWrappers.h              | 36 ++++++++++++++++++-
+ 1 file changed, 35 insertions(+), 1 deletion(-)
+
+diff --git a/bpf/syscall_wrappers/include/BpfSyscallWrappers.h b/bpf/syscall_wrappers/include/BpfSyscallWrappers.h
+index 401c92b..1308fc4 100644
+--- a/bpf/syscall_wrappers/include/BpfSyscallWrappers.h
++++ b/bpf/syscall_wrappers/include/BpfSyscallWrappers.h
+@@ -17,6 +17,7 @@
+ #pragma once
+ 
+ #include <android-base/unique_fd.h>
++#include <fcntl.h>
+ #include <stdlib.h>
+ #include <unistd.h>
+ #include <linux/bpf.h>
+@@ -39,8 +40,41 @@ inline uint64_t ptr_to_u64(const void * const x) {
+  * all unused portions are zero.  It will fail with E2BIG if we don't fully zero bpf_attr.
+  */
+ 
++// A BPF token from /sys/fs/bpf, or -1. Only a bpffs whose owner delegated
++// commands to a user namespace yields one: Deckard's host mounts such a
++// bpffs for Android in a user namespace of its own, where creating maps and
++// loading programs and BTF need the token. Elsewhere none is made.
++inline int bpfToken() {
++    static const int token = [] {
++        const int bpffs = open("/sys/fs/bpf", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
++        if (bpffs < 0) return -1;
++        bpf_attr attr = {};
++        attr.token_create.bpffs_fd = bpffs;
++        const int fd = syscall(__NR_bpf, BPF_TOKEN_CREATE, &attr, sizeof(attr));
++        close(bpffs);
++        return fd;
++    }();
++    return token;
++}
++
+ inline int bpf(enum bpf_cmd cmd, const bpf_attr& attr) {
+-    return syscall(__NR_bpf, cmd, &attr, sizeof(attr));
++    if (cmd != BPF_MAP_CREATE && cmd != BPF_PROG_LOAD && cmd != BPF_BTF_LOAD) {
++        return syscall(__NR_bpf, cmd, &attr, sizeof(attr));
++    }
++    const int token = bpfToken();
++    if (token < 0) return syscall(__NR_bpf, cmd, &attr, sizeof(attr));
++    bpf_attr tokened = attr;
++    if (cmd == BPF_MAP_CREATE) {
++        tokened.map_token_fd = token;
++        tokened.map_flags |= BPF_F_TOKEN_FD;
++    } else if (cmd == BPF_PROG_LOAD) {
++        tokened.prog_token_fd = token;
++        tokened.prog_flags |= BPF_F_TOKEN_FD;
++    } else {
++        tokened.btf_token_fd = token;
++        tokened.btf_flags |= BPF_F_TOKEN_FD;
++    }
++    return syscall(__NR_bpf, cmd, &tokened, sizeof(tokened));
+ }
+ 
+ // this version is meant for use with cmd's which mutate the argument
+-- 
+2.55.0
+
