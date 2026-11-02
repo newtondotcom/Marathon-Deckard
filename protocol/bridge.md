@@ -517,7 +517,7 @@ system channel:
 
 | `t` | Direction | Fields | Meaning |
 |---|---|---|---|
-| `perm_ask` | Android to host | `id` (16 hex digits, DeckardSystem's), `pkg`, `perms` (the Android permissions asked for, 1 to 16), `kind` (`foreground`, `background`, `precise`), `once` (offer "only this time"), `accuracy` (`""`, `choice`, `approximate`), `preciseDefault` | One question. deckard-bridge names `perms` with `PermissionMap::marathon`; all must have the same name. A repeated `id` is ignored. |
+| `perm_ask` | Android to host | `id` (16 hex digits, DeckardSystem's), `pkg`, `perms` (the Android permissions asked for, 1 to 16), `kind` (`foreground`, `background`, `precise`), `once` (offer "only this time"), `accuracy` (`""`, `choice`, `approximate`), `preciseDefault` | One question. deckard-bridge names `perms` with `contract::marathon_permission`; Android permissions without a name are skipped, and the rest must share one name. A repeated `id` is ignored. |
 | `perm_answer` | host to Android | `id`, `answer` (`allow`, `once`, `deny`, `cancel`, `unsupported`), `precise` | The person's answer. `cancel`: dismissed, as Android's back. `unsupported`: Marathon can't ask (a bad or unnamed request, more than 8 waiting, no shell or an older one); Android shows its own dialog. |
 | `perm_cancel` | Android to host | `id` | GrantPermissionsActivity went away; deckard-bridge withdraws the prompt and sends no answer. |
 

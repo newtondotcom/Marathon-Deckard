@@ -170,12 +170,34 @@ fn cxx_permission_prompts_and_settings() -> Result<(), Box<dyn std::error::Error
     answer(&prompt, "sideways", false);
     assert_eq!(reply(&sent)["answer"], "cancel");
 
+    // A group's members without a Marathon name don't stop its prompt.
+    let photos = [
+        "READ_MEDIA_IMAGES",
+        "READ_MEDIA_VISUAL_USER_SELECTED",
+        "ACCESS_MEDIA_LOCATION",
+    ];
+    prompter.handle(&ask("00000000000000ac", &photos, json!({})));
+    let prompt = shown.recv_timeout(WAIT)?;
+    assert_eq!(prompt.1, "storage");
+    answer(&prompt, "deny", false);
+    assert_eq!(reply(&sent)["answer"], "deny");
+
     // Requests Marathon can't draw go back to Android's own dialog.
     let bad = [
         ask(
             "0000000000000001",
             &[],
             json!({"perms":["com.example.permission.CUSTOM"]}),
+        ),
+        ask(
+            "0000000000000008",
+            &[],
+            json!({"perms":["android.permission.CAMERA", "com.example.permission.CUSTOM"]}),
+        ),
+        ask(
+            "0000000000000009",
+            &["READ_MEDIA_VISUAL_USER_SELECTED"],
+            json!({}),
         ),
         ask("0000000000000002", &["CAMERA", "READ_CONTACTS"], json!({})),
         ask("0000000000000003", &[], json!({})),

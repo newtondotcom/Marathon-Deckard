@@ -59,7 +59,13 @@ pub fn prompt(ask: &Map<String, Value>) -> Option<(String, &'static str, Variant
     }
     let mut name = None;
     for permission in perms {
-        let mapped = contract::marathon_permission(permission)?;
+        // Android 16's groups hold members Marathon has no name for.
+        let Some(mapped) = contract::marathon_permission(permission) else {
+            if permission.starts_with("android.permission.") {
+                continue;
+            }
+            return None;
+        };
         if name.is_some_and(|name| name != mapped) {
             return None;
         }
