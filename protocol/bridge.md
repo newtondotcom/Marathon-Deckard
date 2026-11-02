@@ -435,7 +435,7 @@ transfers older than 30 days at start.
 | `sms` | `LaunchAppWithRoute("messages", "conversation", {number, body})`: the thread, with `body` (or the URI's `?body=`) as its draft. No number but a body: `LaunchAppWithRoute("messages", "compose", {body})`, a new message to pick the recipient for. Neither: `LaunchApp("messages")`. |
 | `mailto` | Keel `org.marathonos.email` `mail.compose {to, cc, subject, body}` |
 | `geo` | Keel `org.marathonos.maps` `map.show {lat, lon, name}` for coordinates (or a `q=lat,lon(name)`); `search.show {query}` for a text query (Maps' search page with the results); `LaunchApp("maps")` for neither |
-| `settings` | `LaunchAppWithRoute("settings", page)`: Wi-Fi, Bluetooth, sound, display, date and time, storage, battery, security, keyboard, accounts, about, notifications and the app manager pages; `notifications/waydroid.<pkg>` and `appmanager/waydroid.<pkg>` for one app. Special access (all files, installing apps, overlay, system settings, usage, notification access, Do not disturb, battery, alarms, picture in picture, accessibility): `androidaccess/<kind>`, or `androidaccess/<kind>/<pkg>` when the request names the app, which shows only its switch. Others (location): `LaunchApp("settings")`. |
+| `settings` | `LaunchAppWithRoute("settings", page)`: Wi-Fi, Bluetooth, sound, display, date and time, storage, battery, security, keyboard, accounts, about, notifications and the app manager pages; `notifications/waydroid.<pkg>` and `appmanager/waydroid.<pkg>` for one app, which is also where an app's open-by-default links page (`APP_OPEN_BY_DEFAULT_SETTINGS`) goes. Special access (all files, installing apps, overlay, system settings, usage, notification access, Do not disturb, battery, alarms, picture in picture, accessibility): `androidaccess/<kind>`, or `androidaccess/<kind>/<pkg>` when the request names the app, which shows only its switch. Others (location): `LaunchApp("settings")`. |
 | `pick` `open` / `save` | `org.freedesktop.portal.FileChooser` `OpenFile` / `SaveFile`, with a MIME filter unless the app accepts `*/*` |
 | `pick` `capture` | Keel `org.marathonos.camera` `camera.capture {mode}` (`photo` or `video`), which answers once the person has shot, with `{path, mode}`, and minimises the camera (the call waits up to 10 minutes). The file must be in `~/Pictures/Marathon` and of the kind asked for, or the pick fails. `Cancelled` (the person left the camera), `NotAvailable` or `Timeout` fail it too. A `pick_cancel` drops the request; the camera stays for the person. |
 
@@ -629,8 +629,11 @@ runs as Android's system uid, so Android's own checks admit them
 | `manage` (host to Android) | `id`, `op`, then per op | `info`; `app`, `stop`, `cache`, `clear` with `pkg`; `perm` with `pkg`, `permissions` (Android names), `granted`; `perm_apps` with `permissions`; `notif_apps`; `notifications`, `links` with `pkg`, `enabled`; `battery` with `pkg`, `mode`; `special` with `kind`; `special_set` with `kind`, `pkg`, `granted`; `gms`; `gms_set` with `key`, `enabled`; `gms_open` with `page` |
 | `managed` (Android to host) | `id`, `ok`, `error` or the answer | `info`: `release`, `sdk`. `app`: `GetApp`'s fields, with `perms` (`{name, granted, fixed}` for each runtime permission the app asks for, by Android name) in place of `permissions`. `special`, `perm_apps`, `notif_apps`: `apps`. `gms`: `installed`, `enabled`, `push`, `accounts`. |
 
-DeckardSystem refuses every per-app op on packages with `FLAG_SYSTEM`, so
-only apps the person installed are changed; the `gms` ops act on microG
+DeckardSystem acts only on the apps Android's Settings lists as the
+person's (`ApplicationsState.FILTER_DOWNLOADED_AND_LAUNCHER`): installed apps,
+updated system apps and system apps with an enabled launcher activity, such as F-Droid
+and Aurora Store in the image; it refuses the rest and Deckard's own packages,
+and lists only these; the `gms` ops act on microG
 alone (`GoogleServices.java`). deckard-bridge answers a request with
 an error after 30 s without a reply or when the channel drops, keeps at most
 32 waiting, and cleans each answer (`host/deckard-bridge/src/manage.rs`):
