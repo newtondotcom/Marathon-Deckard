@@ -14,7 +14,8 @@
 # Restarts the Deckard session (never the container) and drives the screen
 # with a uinput touchscreen, so nothing else may use the phone meanwhile.
 #
-# Launches run the apps' desktop entry, as the app grid does. The gesture
+# Launches go through the shell's Navigation1.LaunchApp, as the app grid's
+# do, so the shell's re-show and Deckard's launch both run. The gesture
 # coordinates default to the Zinwa Q25 (720x720) and are set with:
 #   PILL="x y"        bottom pill (swipe up from it opens the switcher)
 #   HOME_DOT="x y"    the switcher's app grid page indicator
@@ -66,8 +67,10 @@ android_front() {
 		sed -n "s/^ *taskId=$tid: \([^/]*\)\/.*/\1/p" | head -n 1
 }
 
-launch() { systemd-run --user -M "$SESSION_USER@" --wait --collect -q \
-	/usr/libexec/deckard-launch app launch "$1"; }
+launch() {
+	as_user busctl --user call org.marathonos.Shell /org/marathonos/Shell/Navigation \
+		org.marathonos.Shell.Navigation1 LaunchApp s "deckard.$1" >/dev/null
+}
 
 cat > "$work/touch.py" <<'EOF'
 # touch.py W H GESTURE...: tap X Y | swipe X0 Y0 X1 Y1 MS, ";"-separated.
