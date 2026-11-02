@@ -19,6 +19,7 @@ rustix.workspace = true
 serde.workspace = true
 tempfile.workspace = true
 zbus = { workspace = true, features = ["proxy", "service"] }
+zip = { version = "=9.2.2", default-features = false }
 
 [lints]
 workspace = true

@@ -14,6 +14,18 @@ use deckard_host_tools::names::{USERNS_BASE, USERNS_IDS, android};
 use crate::Result;
 use crate::command::{self, Command};
 
+/// Where Android's apexd finds the APEX payloads the host mounts in a user
+/// namespace (system/apex 0003, kHostPayloads), each at its APEX file's path.
+const HOST_APEX: &str = "deckard_apex";
+/// Android's directories of pre-installed APEXes, with where each is in the
+/// rootfs: system_ext and product are symlinks into system there.
+const APEX_DIRS: [(&str, &str); 4] = [
+    ("system/apex", "system/apex"),
+    ("system_ext/apex", "system/system_ext/apex"),
+    ("product/apex", "system/product/apex"),
+    ("vendor/apex", "vendor/apex"),
+];
+
 #[derive(Clone, Debug)]
 pub struct MountLayout {
     pub work: PathBuf,
@@ -179,18 +191,80 @@ impl MountLayout {
         for upper in &uppers {
             shift_ids(upper, self.userns)?;
         }
+        // apexd takes the payloads from the host whenever this exists.
+        let payloads = self.work.join("overlay_rw/system").join(HOST_APEX);
+        if !self.userns && fs::symlink_metadata(&payloads).is_ok() {
+            fs::remove_dir_all(&payloads)?;
+        }
         let mut completed = Vec::new();
-        for command in commands {
-            let target = command.args.last().cloned().ok_or("mount target missing")?;
-            if let Err(error) = command::run(command) {
-                for target in completed.into_iter().rev() {
-                    let _ = command::run(Command::new(["umount".into(), target]));
-                }
-                return Err(error);
+        let run = |commands: Vec<Command>, completed: &mut Vec<String>| -> Result<()> {
+            for command in commands {
+                let target = command.args.last().cloned().ok_or("mount target missing")?;
+                command::run(command)?;
+                completed.push(target);
             }
-            completed.push(target);
+            Ok(())
+        };
+        let mut result = run(commands, &mut completed);
+        if result.is_ok() && self.userns {
+            result = self
+                .apex_payloads()
+                .and_then(|commands| run(commands, &mut completed));
+        }
+        if let Err(error) = result {
+            for target in completed.into_iter().rev() {
+                let _ = command::run(Command::new(["umount".into(), target]));
+            }
+            return Err(error);
         }
         Ok(())
+    }
+
+    /// The mounts of the pre-installed APEXes' payloads, read-only and
+    /// idmapped, for apexd to bind (`userns`).
+    ///
+    /// # Errors
+    /// An APEX directory cannot be read, or an APEX is not a zip with a
+    /// stored payload.
+    fn apex_payloads(&self) -> Result<Vec<Command>> {
+        let root = self.rootfs();
+        let mut commands = Vec::new();
+        for (android, host) in APEX_DIRS {
+            let Some(entries) = files::found(fs::read_dir(root.join(host)))? else {
+                continue;
+            };
+            for entry in entries {
+                let path = entry?.path();
+                if path.extension().is_none_or(|extension| extension != "apex") {
+                    continue;
+                }
+                let mut apex = zip::ZipArchive::new(fs::File::open(&path)?)?;
+                let payload = apex.by_name("apex_payload.img")?;
+                let offset = payload
+                    .data_start()
+                    .ok_or("APEX payload has no data offset")?;
+                crate::ensure(
+                    payload.compression() == zip::CompressionMethod::Stored,
+                    format!("APEX payload is compressed: {}", path.display()),
+                )?;
+                let name = path.file_name().ok_or("APEX without a name")?;
+                let target = root.join(HOST_APEX).join(android).join(name);
+                validate_path_syntax(&target)?;
+                fs::create_dir_all(&target)?;
+                let options = format!(
+                    "ro,nodev,loop,offset={offset},sizelimit={},X-mount.idmap=b:0:{USERNS_BASE}:{USERNS_IDS}",
+                    payload.size()
+                );
+                commands.push(Command::new([
+                    "mount".to_owned(),
+                    "-o".to_owned(),
+                    options,
+                    display(&path),
+                    display(&target),
+                ]));
+            }
+        }
+        Ok(commands)
     }
 
     /// Whether anything is mounted beneath the rootfs.
