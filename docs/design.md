@@ -600,6 +600,10 @@ marathon-mesa-android is a bionic build of the same Mesa release the host ships,
 
 Rootless. deckard-containerd runs as the session user in a user namespace with the user mapped to UID 0 inside and userns CAP_SYS_ADMIN. Android init mounts binderfs itself (mount -t binder binder /dev/binderfs), which the kernel permits because binderfs is FS_USERNS_MOUNT. No host root helper after boot.
 
+As built, the container is privileged: root deckard-containerd starts LXC in the initial user namespace, so Android's root is the host's root, held back only by the capability list, LXC's seccomp profile and a per-start device cgroup (only the nodes the container binds, the pseudo-devices and the loop devices the host has not attached).
+
+userns = True in deckard.cfg starts Android in a user namespace instead: Android's ids 0 to 2^20 are host ids 0x70000000 onward, root's range in /etc/subuid and /etc/subgid (the deckard package adds it). Nothing on disk is rewritten except the overlay's writable layers. The images and overlay/ are mounted idmapped, the session's Wayland and PulseAudio sockets and /data are bound idmapped by LXC (idmap=container), and the host stages Android's own copies of its device nodes. It cannot boot the image yet. deckard-preinit must leave the host's nodes and mounts in place (image patch), and apexd must adopt APEX payloads the host mounts, because a user namespace can neither attach loop devices nor mount ext4 or erofs.
+
 ashmem replaced by memfd (sys.use_memfd=true); no ashmem driver required on the host kernel.
 
 cgroup2 subtree delegated writable with +freezer, +memory and +cpu, so Android's process groups and cached-app freezer work. A memory budget for the container (memory.max) is set so lmkd inside Android acts before the host OOM killer does.
