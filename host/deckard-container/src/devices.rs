@@ -1,5 +1,7 @@
 //! The container's device cgroup: Android may open and create only the
-//! nodes its config binds, the pseudo-devices every Linux system has, and
+//! nodes of Deckard's node list for the host as it is at start
+//! ([`initializer::node_entries`], which also renders `config_nodes`), the
+//! pseudo-devices every Linux system has, and
 //! the loop devices the host has not attached, which apexd takes for
 //! APEXes. Host disks, device-mapper, the modem and every other node stay
 //! closed to it, even to its root.
@@ -19,6 +21,7 @@ use rustix::fs::{CWD, FileType, Mode, major, makedev, minor, mknodat};
 
 use crate::Result;
 use crate::command::{self, Command};
+use crate::initializer::{self, Host};
 use crate::mounts;
 
 /// null, zero, full, random, urandom, kmsg, tty, ptmx, the pty slaves and
@@ -53,28 +56,15 @@ struct Node {
 /// returns its path.
 ///
 /// # Errors
-/// The instance's `config_nodes` or `/sys/block` cannot be read, or the
-/// file cannot be written.
+/// The host cannot be probed, `/sys/block` cannot be read, or the file
+/// cannot be written.
 pub fn write(instance: &Path, userns: bool) -> Result<PathBuf> {
-    let config = fs::read_to_string(instance.join("config_nodes"))?;
-    let mut bound = Vec::new();
-    for (source, target) in bound_sources(&config) {
-        let Ok(metadata) = fs::metadata(source) else {
-            continue;
-        };
-        let kind = match metadata.file_type() {
-            kind if kind.is_char_device() => 'c',
-            kind if kind.is_block_device() => 'b',
-            _ => continue,
-        };
-        bound.push(Node {
-            target: target.to_owned(),
-            kind,
-            major: major(metadata.rdev()),
-            minor: minor(metadata.rdev()),
-            mode: metadata.mode() & 0o7777,
-        });
-    }
+    let work = instance
+        .parent()
+        .and_then(Path::parent)
+        .ok_or("LXC instance outside a work directory")?;
+    let entries = initializer::node_entries(&Host::probe()?, work);
+    let bound = device_nodes(&entries, host_node);
     let mut text = render(&bound, &attached_loops(Path::new("/sys/block"))?);
     if userns {
         let own = OWN_NODES.map(|(name, major, minor, mode)| Node {
@@ -107,13 +97,43 @@ pub fn write(instance: &Path, userns: bool) -> Result<PathBuf> {
     Ok(path)
 }
 
-/// The `/dev` sources of `config_nodes`' mount entries, with their targets.
-fn bound_sources(nodes: &str) -> impl Iterator<Item = (&str, &str)> {
-    nodes.lines().filter_map(|line| {
-        let mut fields = line.strip_prefix("lxc.mount.entry = ")?.split(' ');
-        let (source, target) = (fields.next()?, fields.next()?);
-        source.starts_with("/dev/").then_some((source, target))
-    })
+/// The device nodes among mount `entries`, as `stat` finds their sources.
+fn device_nodes(
+    entries: &[String],
+    stat: impl Fn(&str) -> Option<(char, u32, u32, u32)>,
+) -> Vec<Node> {
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let mut fields = entry.split(' ');
+            let (source, target) = (fields.next()?, fields.next()?);
+            let (kind, major, minor, mode) = stat(
+                source
+                    .strip_prefix('/')?
+                    .starts_with("dev/")
+                    .then_some(source)?,
+            )?;
+            Some(Node {
+                target: target.to_owned(),
+                kind,
+                major,
+                minor,
+                mode,
+            })
+        })
+        .collect()
+}
+
+/// A host device node's type, number and mode.
+fn host_node(path: &str) -> Option<(char, u32, u32, u32)> {
+    let metadata = fs::metadata(path).ok()?;
+    let kind = match metadata.file_type() {
+        kind if kind.is_char_device() => 'c',
+        kind if kind.is_block_device() => 'b',
+        _ => return None,
+    };
+    let rdev = metadata.rdev();
+    Some((kind, major(rdev), minor(rdev), metadata.mode() & 0o7777))
 }
 
 /// Makes `nodes` afresh on a tmpfs at `stage`, root's and so the container
@@ -197,4 +217,63 @@ fn render(bound: &[Node], attached: &BTreeSet<u32>) -> String {
         allow(&format!("b {LOOP_MAJOR}:{minor}"));
     }
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+    use crate::drivers::DriverNodes;
+
+    #[test]
+    fn every_node_the_initializer_binds_is_allowed() {
+        let devices = [
+            "/dev/zero",
+            "/dev/fuse",
+            "/dev/uhid",
+            "/dev/net/tun",
+            "/dev/video0",
+            "/dev/dma_heap/system",
+            "/dev/sw_sync",
+        ];
+        let host = Host {
+            arch: "arm64",
+            lxc_arch: "aarch64",
+            lxc_major: 7,
+            nodes: DriverNodes {
+                binder: "binder".into(),
+                vndbinder: "vndbinder".into(),
+                hwbinder: "hwbinder".into(),
+            },
+            devices: devices.iter().map(|path| (*path).to_owned()).collect(),
+            render_node: Some("/dev/dri/renderD128".into()),
+            vulkan: None,
+            products: Vec::new(),
+            ashmem: false,
+        };
+        let entries = initializer::node_entries(&host, Path::new("/var/lib/deckard"));
+        let sources: Vec<&str> = entries
+            .iter()
+            .filter_map(|entry| entry.split(' ').next())
+            .filter(|source| source.starts_with("/dev/") && *source != "/dev/char")
+            .collect();
+        let numbers: HashMap<&str, u32> = sources.iter().zip(1..).map(|(s, n)| (*s, n)).collect();
+        let numbers = &numbers;
+        let nodes = device_nodes(&entries, |path| {
+            let minor = match path {
+                "/dev/fuse" => 229,
+                _ => *numbers.get(path)?,
+            };
+            Some(('c', 10, minor, 0o666))
+        });
+        let rules = render(&nodes, &BTreeSet::new());
+        assert_eq!(nodes.len(), sources.len(), "{sources:?}");
+        for node in &nodes {
+            let rule = format!("allow = c 10:{} rwm\n", node.minor);
+            assert!(rules.contains(&rule), "{} has no rule", node.target);
+        }
+        assert!(rules.contains("allow = c 10:229 rwm\n"), "/dev/fuse");
+        assert!(nodes.iter().any(|node| node.target == "dev/fuse"));
+    }
 }
