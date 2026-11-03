@@ -6,6 +6,7 @@ use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use gstreamer as gst;
 use gstreamer::prelude::*;
@@ -23,6 +24,9 @@ use crate::wire::{self, Message, Request};
 /// Frames the HAL may hold at once; libcamera keeps the rest.
 const FRAMES_OUT: usize = 2;
 const MAX_FPS: u32 = 30;
+/// How long an open waits for a camera another process is releasing.
+const OPEN_WAIT: Duration = Duration::from_millis(1500);
+const OPEN_RETRY: Duration = Duration::from_millis(100);
 
 #[derive(Default)]
 struct Frames {
@@ -194,10 +198,15 @@ fn open(socket: &Arc<OwnedFd>, camera: &Camera) -> Result<Stream, u32> {
             })
             .build(),
     );
-    if pipeline.set_state(gst::State::Ready).is_err() {
+    // The app that just left the foreground may still be letting go.
+    let deadline = Instant::now() + OPEN_WAIT;
+    while pipeline.set_state(gst::State::Ready).is_err() {
         let code = open_error(&pipeline);
         let _ = pipeline.set_state(gst::State::Null);
-        return Err(code);
+        if code != wire::BUSY || Instant::now() >= deadline {
+            return Err(code);
+        }
+        thread::sleep(OPEN_RETRY);
     }
     let bus = pipeline.bus().map(|bus| {
         let to_hal = Arc::clone(socket);
