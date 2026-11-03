@@ -24,7 +24,7 @@ shared_ptr.
  camera/ExternalCameraDeviceSession.cpp        | 396 +++---------------
  camera/ExternalCameraDeviceSession.h          |  13 +-
  camera/ExternalCameraOfflineSession.cpp       |  27 +-
- camera/ExternalCameraProvider.cpp             | 314 ++++----------
+ camera/ExternalCameraProvider.cpp             | 315 ++++----------
  camera/ExternalCameraProvider.h               |  35 +-
  camera/ExternalCameraUtils.cpp                |  75 ++--
  camera/ExternalCameraUtils.h                  |  32 +-
@@ -33,7 +33,7 @@ shared_ptr.
  ...ware.camera.provider-V1-deckard-service.rc |   8 +
  ...are.camera.provider-V1-deckard-service.xml |   7 +
  camera/{external-service.cpp => service.cpp}  |  15 +-
- 15 files changed, 816 insertions(+), 900 deletions(-)
+ 15 files changed, 817 insertions(+), 900 deletions(-)
  create mode 100644 camera/Android.bp
  create mode 100644 camera/HostCamera.cpp
  create mode 100644 camera/HostCamera.h
@@ -1304,7 +1304,7 @@ index 2d4e2e0..3063323 100644
              Status st = parent->processCaptureRequestError(req);
              if (st != Status::OK) {
 diff --git a/camera/ExternalCameraProvider.cpp b/camera/ExternalCameraProvider.cpp
-index 54875ab..4818473 100644
+index 54875ab..f1e1861 100644
 --- a/camera/ExternalCameraProvider.cpp
 +++ b/camera/ExternalCameraProvider.cpp
 @@ -14,7 +14,7 @@
@@ -1452,7 +1452,7 @@ index 54875ab..4818473 100644
          *_aidl_return = nullptr;
          return fromStatus(Status::INTERNAL_ERROR);
      }
-@@ -172,209 +156,77 @@ ndk::ScopedAStatus ExternalCameraProvider::isConcurrentStreamCombinationSupporte
+@@ -172,209 +156,78 @@ ndk::ScopedAStatus ExternalCameraProvider::isConcurrentStreamCombinationSupporte
      return fromStatus(Status::OK);
  }
  
@@ -1667,7 +1667,8 @@ index 54875ab..4818473 100644
 -        // invalid event. skip
 +bool ExternalCameraProvider::HostWatchThread::threadLoop() {
 +    std::shared_ptr<HostConnection> host = HostConnection::connect();
-+    if (host == nullptr) {
++    // No cameras while another process streams from them: ask again later.
++    if (host == nullptr || host->cameras().empty()) {
 +        std::this_thread::sleep_for(kReconnectDelay);
          return true;
      }
