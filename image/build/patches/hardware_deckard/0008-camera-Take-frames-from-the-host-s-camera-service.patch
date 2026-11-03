@@ -123,7 +123,7 @@ index 0000000..c180397
 +    local_include_dirs: ["."],
 +}
 diff --git a/camera/ExternalCameraDevice.cpp b/camera/ExternalCameraDevice.cpp
-index 8e84748..5a6892a 100644
+index 8e84748..39b4096 100644
 --- a/camera/ExternalCameraDevice.cpp
 +++ b/camera/ExternalCameraDevice.cpp
 @@ -22,8 +22,6 @@
@@ -167,7 +167,7 @@ index 8e84748..5a6892a 100644
 -        ALOGE("%s: device path match failed for %s", __FUNCTION__, mDevicePath.c_str());
 -    }
 -}
-+    : mCameraId(cameraId), mCfg(config), mInfo(info) {}
++    : mCameraId(cameraId), mInfo(info), mCfg(config) {}
  
  ExternalCameraDevice::~ExternalCameraDevice() {}
  
