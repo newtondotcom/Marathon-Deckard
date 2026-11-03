@@ -1,0 +1,262 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: patrickjquinn <patrick.jm.quinn@gmail.com>
+Date: Tue, 3 Nov 2026 10:32:58 +0000
+Subject: [PATCH] hwcomposer: Draw rotated and tiled layers into a linear copy
+
+Two faults showed with a camera preview on the Zinwa Q25 (Panfrost):
+- The RGB copy a YUV frame is drawn into was allocated with GPU usage
+  only, so minigbm tiled it (ARM 16x16 u-interleaved), and the copy path,
+  which hands the compositor a linear dmabuf, refused it: no frame was
+  ever shown. CPU read usage makes minigbm allocate it linear.
+- Marathon's compositor (Qt Wayland 6.11) takes wl_surface buffer
+  transforms only as a content orientation: it does not rotate, and its
+  viewporter checks the source against the untransformed buffer. The
+  rotated layer's viewport made it end the connection every frame, which
+  also stalled every buffer release behind it.
+A layer shown with a transform is now drawn through the same GPU copy,
+turned as it should appear, attached with no transform and cropped in
+the copy's coordinates. The transform is part of the buffer's cache key,
+so a layer that turns gets a new copy.
+---
+ hwcomposer/egl-tools.cpp       | 32 +++++++++++++++++++++++++++--
+ hwcomposer/gralloc_handler.cpp | 29 ++++++++++++++++++++------
+ hwcomposer/hwcomposer.cpp      | 37 ++++++++++++++++++++++++++++++++--
+ hwcomposer/wayland-hwc.h       | 10 ++++++++-
+ 4 files changed, 97 insertions(+), 11 deletions(-)
+
+diff --git a/hwcomposer/egl-tools.cpp b/hwcomposer/egl-tools.cpp
+index 0e99852..cb8f897 100644
+--- a/hwcomposer/egl-tools.cpp
++++ b/hwcomposer/egl-tools.cpp
+@@ -131,8 +131,9 @@ GLuint yuv_program() {
+         return program;
+     const char *vs =
+             "attribute vec2 pos;\n"
++            "attribute vec2 tc;\n"
+             "varying vec2 uv;\n"
+-            "void main() { uv = pos * 0.5 + 0.5; gl_Position = vec4(pos, 0.0, 1.0); }\n";
++            "void main() { uv = tc; gl_Position = vec4(pos, 0.0, 1.0); }\n";
+     const char *fs =
+             "#extension GL_OES_EGL_image_external : require\n"
+             "precision mediump float;\n"
+@@ -148,6 +149,7 @@ GLuint yuv_program() {
+         glAttachShader(program, shader);
+     }
+     glBindAttribLocation(program, 0, "pos");
++    glBindAttribLocation(program, 1, "tc");
+     glLinkProgram(program);
+     GLint linked = GL_FALSE;
+     glGetProgramiv(program, GL_LINK_STATUS, &linked);
+@@ -156,6 +158,27 @@ GLuint yuv_program() {
+     return program;
+ }
+ 
++/* Where each corner of the copy samples the frame: the inverse of the
++ * layer's transform (flips first, then the quarter turn), in texture
++ * coordinates whose rows run like the buffer's. */
++void copy_texcoords(uint32_t transform, GLfloat out[8]) {
++    static const GLfloat corners[] = { 0, 0, 1, 0, 0, 1, 1, 1 };
++    for (int i = 0; i < 4; i++) {
++        GLfloat u = corners[2 * i], v = corners[2 * i + 1];
++        if (transform & HWC_TRANSFORM_ROT_90) {
++            GLfloat t = u;
++            u = v;
++            v = 1 - t;
++        }
++        if (transform & HWC_TRANSFORM_FLIP_V)
++            v = 1 - v;
++        if (transform & HWC_TRANSFORM_FLIP_H)
++            u = 1 - u;
++        out[2 * i] = u;
++        out[2 * i + 1] = v;
++    }
++}
++
+ struct YuvObjects {
+     EGLImageKHR images[2];
+     GLuint textures[2];
+@@ -224,12 +247,17 @@ void draw_yuv(struct display* display, struct buffer* buf) {
+     const auto &metadata = buf->metadata;
+     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, buf->yuv_textures[1], 0);
+     static const GLfloat quad[] = { -1, -1, 1, -1, -1, 1, 1, 1 };
+-    glViewport(0, 0, metadata.width, metadata.height);
++    GLfloat texcoords[8];
++    copy_texcoords(metadata.transform, texcoords);
++    glViewport(0, 0, copy_width(metadata), copy_height(metadata));
+     glUseProgram(yuv_program());
+     glBindTexture(GL_TEXTURE_EXTERNAL_OES, buf->yuv_textures[0]);
+     glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, quad);
+     glEnableVertexAttribArray(0);
++    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, texcoords);
++    glEnableVertexAttribArray(1);
+     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
++    glDisableVertexAttribArray(1);
+     // The compositor samples the buffer as soon as it is committed.
+     glFinish();
+     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+diff --git a/hwcomposer/gralloc_handler.cpp b/hwcomposer/gralloc_handler.cpp
+index f2139a3..9a789cc 100644
+--- a/hwcomposer/gralloc_handler.cpp
++++ b/hwcomposer/gralloc_handler.cpp
+@@ -314,11 +314,15 @@ std::unique_ptr<buffer> create_buffer_gbm(wl_conn *conn, const buffer_metadata&
+     return create_dmabuf_wl_buffer(conn, metadata, drm_handle->prime_fd, -1 /* compute drm format */, drm_handle->stride, 0 /* offset */, drm_handle->modifier, handle);
+ }
+ std::unique_ptr<buffer> create_converted_wl_buffer(wl_conn *conn, const buffer_metadata& metadata, buffer_handle_t handle) {
++    const uint32_t width = copy_width(metadata), height = copy_height(metadata);
++    // CPU read access makes minigbm allocate linear; the GPU would tile it.
+     android::sp<android::GraphicBuffer> rgb = new android::GraphicBuffer(
+-            metadata.width, metadata.height, HAL_PIXEL_FORMAT_BGRA_8888, 1,
+-            GRALLOC_USAGE_HW_RENDER | GRALLOC_USAGE_HW_TEXTURE | GRALLOC_USAGE_HW_COMPOSER, "deckard-yuv");
++            width, height, HAL_PIXEL_FORMAT_BGRA_8888, 1,
++            GRALLOC_USAGE_HW_RENDER | GRALLOC_USAGE_HW_TEXTURE | GRALLOC_USAGE_HW_COMPOSER |
++                    GRALLOC_USAGE_SW_READ_RARELY,
++            "deckard-yuv");
+     if (rgb->initCheck() != android::OK) {
+-        ALOGE("create_converted_wl_buffer: allocating %ux%u failed", metadata.width, metadata.height);
++        ALOGE("create_converted_wl_buffer: allocating %ux%u failed", width, height);
+         return nullptr;
+     }
+     auto *cros = reinterpret_cast<const cros_gralloc_handle *>(rgb->handle);
+@@ -326,14 +330,19 @@ std::unique_ptr<buffer> create_converted_wl_buffer(wl_conn *conn, const buffer_m
+         ALOGE("create_converted_wl_buffer: modifier 0x%" PRIx64 " is not linear", (uint64_t)cros->format_modifier);
+         return nullptr;
+     }
+-    auto buf = create_dmabuf_wl_buffer(conn, metadata, cros->fds[0], DRM_FORMAT_ARGB8888, cros->strides[0],
++    buffer_metadata copy = metadata;
++    copy.width = width;
++    copy.height = height;
++    auto buf = create_dmabuf_wl_buffer(conn, copy, cros->fds[0], DRM_FORMAT_ARGB8888, cros->strides[0],
+                                        cros->offsets[0], DRM_FORMAT_MOD_LINEAR, handle);
++    buf->metadata = metadata;
+     buf->converted = rgb;
+     return buf;
+ }
+ std::unique_ptr<buffer> create_buffer_cros(wl_conn *conn, const buffer_metadata& metadata, buffer_handle_t handle) {
+-    // Compositors that cannot import planar YUV kill the connection over it.
+-    if (is_yuv_format(metadata.format)) {
++    // Compositors that cannot import planar YUV kill the connection over it,
++    // and Marathon's ignores buffer transforms: both are drawn into a copy.
++    if (is_yuv_format(metadata.format) || metadata.transform != 0) {
+         if (auto buf = create_converted_wl_buffer(conn, metadata, handle))
+             return buf;
+         return create_shm_wl_buffer(conn, metadata, handle);
+@@ -427,6 +436,14 @@ bool cpu_render_to_pixels(buffer *buffer) {
+     return ok;
+ }
+ 
++uint32_t copy_width(const buffer_metadata &metadata) {
++    return (metadata.transform & HWC_TRANSFORM_ROT_90) ? metadata.height : metadata.width;
++}
++
++uint32_t copy_height(const buffer_metadata &metadata) {
++    return (metadata.transform & HWC_TRANSFORM_ROT_90) ? metadata.width : metadata.height;
++}
++
+ bool is_yuv_format(uint32_t hal_format) {
+     return hal_format == HAL_PIXEL_FORMAT_YV12
+         || hal_format == HAL_PIXEL_FORMAT_YCBCR_420_888
+diff --git a/hwcomposer/hwcomposer.cpp b/hwcomposer/hwcomposer.cpp
+index b872c7e..a0418ce 100644
+--- a/hwcomposer/hwcomposer.cpp
++++ b/hwcomposer/hwcomposer.cpp
+@@ -17,6 +17,9 @@
+ 
+ #include "hwcomposer.h"
+ 
++#include <algorithm>
++#include <utility>
++
+ #include <errno.h>
+ #include <pthread.h>
+ #include <semaphore.h>
+@@ -88,6 +91,28 @@ namespace {
+         return src;
+     }
+ 
++    /* The source crop, in buffer pixels, in the copy the buffer was drawn
++     * into turned by `transform` (flips first, then the quarter turn). */
++    hwc_frect_t crop_in_copy(hwc_frect_t src, uint32_t transform, float width, float height) {
++        auto map = [&](float x, float y) {
++            if (transform & HWC_TRANSFORM_FLIP_H)
++                x = width - x;
++            if (transform & HWC_TRANSFORM_FLIP_V)
++                y = height - y;
++            if (transform & HWC_TRANSFORM_ROT_90)
++                return std::pair<float, float>(height - y, x);
++            return std::pair<float, float>(x, y);
++        };
++        auto [x0, y0] = map(src.left, src.top);
++        auto [x1, y1] = map(src.right, src.bottom);
++        return hwc_frect_t {
++            .left = std::min(x0, x1),
++            .top = std::min(y0, y1),
++            .right = std::max(x0, x1),
++            .bottom = std::max(y0, y1)
++        };
++    }
++
+     /* Buffers of the layers showing: a few per window, a few per video. */
+     constexpr size_t kMaxCachedBuffers = 64;
+ 
+@@ -128,6 +153,8 @@ namespace {
+             return nullptr;
+         }
+         auto metadata = gralloc_handler.get_buffer_metadata(pdev->display, layer, pos);
++        if (!(layer->flags & HWC_IS_CURSOR_LAYER))
++            metadata.transform = layer->transform;
+         if (!metadata.format) {
+             // hwc_set can run before the setLayerHandleInfo HIDL call arrives.
+             ALOGW("get_wl_buffer: skipping pos=%zu, metadata not ready (map size=%zu)",
+@@ -558,10 +585,16 @@ static int apply_hwc_layer_to_surface_context(deckard_hwc_composer_device_1 *pde
+ 
+     surface_context.attach_buffer(buf);
+     apply_surface_damage(hwc_layer, surface_context);
+-    surface_context.set_buffer_transform(hwc_transform_to_buffer_transform(hwc_layer->transform));
++    // A copy is drawn already turned; Marathon's compositor ignores transforms.
++    surface_context.set_buffer_transform(hwc_transform_to_buffer_transform(
++            buf->converted ? 0 : hwc_layer->transform));
+     // Scaling can only be supported correctly with wp_viewport
+     if (surface_context.viewport) {
+-        surface_context.set_crop(rect_apply_transform(hwc_layer->sourceCropf, hwc_layer->transform));
++        if (buf->converted)
++            surface_context.set_crop(crop_in_copy(hwc_layer->sourceCropf, buf->metadata.transform,
++                                                  buf->metadata.width, buf->metadata.height));
++        else
++            surface_context.set_crop(rect_apply_transform(hwc_layer->sourceCropf, hwc_layer->transform));
+         surface_context.set_display_frame(hwc_layer->displayFrame, pdev->display->scale);
+     } else {
+         surface_context.set_buffer_scale(pdev->display->scale);
+diff --git a/hwcomposer/wayland-hwc.h b/hwcomposer/wayland-hwc.h
+index a8b040d..e91e640 100644
+--- a/hwcomposer/wayland-hwc.h
++++ b/hwcomposer/wayland-hwc.h
+@@ -124,13 +124,17 @@ struct buffer_metadata {
+     /* The allocator's unique buffer id where it has one (minigbm), so a
+      * handle reused for a new buffer never matches the old one's entry. */
+     uint32_t id = 0;
++    /* The layer's HWC_TRANSFORM_*: a buffer shown rotated is drawn rotated
++     * into its copy (the compositor ignores wl_surface buffer transforms). */
++    uint32_t transform = 0;
+ };
+ constexpr bool operator==(const buffer_metadata &lhs, const buffer_metadata &rhs) {
+     return lhs.height == rhs.height
+            && lhs.width == rhs.width
+            && lhs.pixel_stride == rhs.pixel_stride
+            && lhs.format == rhs.format
+-           && lhs.id == rhs.id;
++           && lhs.id == rhs.id
++           && lhs.transform == rhs.transform;
+ }
+ constexpr bool operator!=(const buffer_metadata &lhs, const buffer_metadata &rhs) {
+     return !(lhs == rhs);
+@@ -163,6 +167,10 @@ struct buffer {
+     ~buffer();
+ };
+ 
++/* The copy's size: a quarter turn swaps width and height. */
++uint32_t copy_width(const buffer_metadata &metadata);
++uint32_t copy_height(const buffer_metadata &metadata);
++
+ enum class BufferTransform : int32_t {
+     Normal = WL_OUTPUT_TRANSFORM_NORMAL,
+     Rot_90 = WL_OUTPUT_TRANSFORM_90,
