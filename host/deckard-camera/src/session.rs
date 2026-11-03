@@ -203,7 +203,9 @@ fn open(socket: &Arc<OwnedFd>, camera: &Camera) -> Result<Stream, u32> {
     while pipeline.set_state(gst::State::Ready).is_err() {
         let code = open_error(&pipeline);
         let _ = pipeline.set_state(gst::State::Null);
-        if code != wire::BUSY || Instant::now() >= deadline {
+        // While another process streams, libcamera also fails to enumerate
+        // the camera at all: not found means busy too.
+        if !matches!(code, wire::BUSY | wire::GONE) || Instant::now() >= deadline {
             return Err(code);
         }
         thread::sleep(OPEN_RETRY);
