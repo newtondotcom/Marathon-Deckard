@@ -18,22 +18,22 @@ are present while a connection to the host is open.
 Also fixes switchToOffline wrapping a frame it does not own in a second
 shared_ptr.
 ---
- camera/Android.bp                             |  75 ++++
- camera/ExternalCameraDevice.cpp               | 264 ++----------
+ camera/Android.bp                             |  75 +++
+ camera/ExternalCameraDevice.cpp               | 268 ++---------
  camera/ExternalCameraDevice.h                 |  27 +-
- camera/ExternalCameraDeviceSession.cpp        | 396 +++---------------
+ camera/ExternalCameraDeviceSession.cpp        | 432 ++++--------------
  camera/ExternalCameraDeviceSession.h          |  13 +-
  camera/ExternalCameraOfflineSession.cpp       |  27 +-
- camera/ExternalCameraProvider.cpp             | 315 ++++----------
+ camera/ExternalCameraProvider.cpp             | 315 ++++---------
  camera/ExternalCameraProvider.h               |  35 +-
- camera/ExternalCameraUtils.cpp                |  75 ++--
+ camera/ExternalCameraUtils.cpp                |  75 +--
  camera/ExternalCameraUtils.h                  |  32 +-
- camera/HostCamera.cpp                         | 314 ++++++++++++++
+ camera/HostCamera.cpp                         | 314 +++++++++++++
  camera/HostCamera.h                           | 114 +++++
  ...ware.camera.provider-V1-deckard-service.rc |   8 +
  ...are.camera.provider-V1-deckard-service.xml |   7 +
- camera/{external-service.cpp => service.cpp}  |  15 +-
- 15 files changed, 817 insertions(+), 900 deletions(-)
+ camera/{external-service.cpp => service.cpp}  |  18 +-
+ 15 files changed, 852 insertions(+), 908 deletions(-)
  create mode 100644 camera/Android.bp
  create mode 100644 camera/HostCamera.cpp
  create mode 100644 camera/HostCamera.h
@@ -123,7 +123,7 @@ index 0000000..c180397
 +    local_include_dirs: ["."],
 +}
 diff --git a/camera/ExternalCameraDevice.cpp b/camera/ExternalCameraDevice.cpp
-index 8e84748..39b4096 100644
+index 8e84748..39058b7 100644
 --- a/camera/ExternalCameraDevice.cpp
 +++ b/camera/ExternalCameraDevice.cpp
 @@ -22,8 +22,6 @@
@@ -297,7 +297,18 @@ index 8e84748..39b4096 100644
      if (hasColor) {
          availableCapabilities.push_back(ANDROID_REQUEST_AVAILABLE_CAPABILITIES_BACKWARD_COMPATIBLE);
      }
-@@ -420,7 +381,7 @@ status_t ExternalCameraDevice::initDefaultCharsKeys(
+@@ -399,10 +360,6 @@ status_t ExternalCameraDevice::initDefaultCharsKeys(
+     const uint8_t hotPixelMode = ANDROID_HOT_PIXEL_MODE_OFF;
+     UPDATE(ANDROID_HOT_PIXEL_AVAILABLE_HOT_PIXEL_MODES, &hotPixelMode, 1);
+ 
+-    // android.info
+-    const uint8_t bufMgrVer = ANDROID_INFO_SUPPORTED_BUFFER_MANAGEMENT_VERSION_HIDL_DEVICE_3_5;
+-    UPDATE(ANDROID_INFO_SUPPORTED_BUFFER_MANAGEMENT_VERSION, &bufMgrVer, 1);
+-
+     // android.jpeg
+     const int32_t jpegAvailableThumbnailSizes[] = {0,   0,   176, 144, 240, 144, 256,
+                                                    144, 240, 160, 256, 154, 240, 180};
+@@ -420,7 +377,7 @@ status_t ExternalCameraDevice::initDefaultCharsKeys(
      const uint8_t opticalStabilizationMode = ANDROID_LENS_OPTICAL_STABILIZATION_MODE_OFF;
      UPDATE(ANDROID_LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION, &opticalStabilizationMode, 1);
  
@@ -306,7 +317,7 @@ index 8e84748..39b4096 100644
      UPDATE(ANDROID_LENS_FACING, &facing, 1);
  
      // android.noiseReduction
-@@ -468,12 +429,8 @@ status_t ExternalCameraDevice::initDefaultCharsKeys(
+@@ -468,12 +425,8 @@ status_t ExternalCameraDevice::initDefaultCharsKeys(
      const uint8_t timestampSource = ANDROID_SENSOR_INFO_TIMESTAMP_SOURCE_UNKNOWN;
      UPDATE(ANDROID_SENSOR_INFO_TIMESTAMP_SOURCE, &timestampSource, 1);
  
@@ -321,7 +332,7 @@ index 8e84748..39b4096 100644
      UPDATE(ANDROID_SENSOR_ORIENTATION, &orientation, 1);
  
      // android.shading
-@@ -583,7 +540,7 @@ status_t ExternalCameraDevice::initDefaultCharsKeys(
+@@ -583,7 +536,7 @@ status_t ExternalCameraDevice::initDefaultCharsKeys(
  }
  
  status_t ExternalCameraDevice::initCameraControlsCharsKeys(
@@ -330,7 +341,7 @@ index 8e84748..39b4096 100644
      // android.sensor.info.sensitivityRange   -> V4L2_CID_ISO_SENSITIVITY
      // android.sensor.info.exposureTimeRange  -> V4L2_CID_EXPOSURE_ABSOLUTE
      // android.sensor.info.maxFrameDuration   -> TBD
-@@ -624,28 +581,21 @@ status_t ExternalCameraDevice::initCameraControlsCharsKeys(
+@@ -624,28 +577,21 @@ status_t ExternalCameraDevice::initCameraControlsCharsKeys(
  }
  
  status_t ExternalCameraDevice::initOutputCharsKeys(
@@ -362,7 +373,7 @@ index 8e84748..39b4096 100644
                  hasColor = true;
                  break;
              default:
-@@ -655,22 +605,9 @@ status_t ExternalCameraDevice::initOutputCharsKeys(
+@@ -655,22 +601,9 @@ status_t ExternalCameraDevice::initOutputCharsKeys(
          }
      }
  
@@ -386,7 +397,7 @@ index 8e84748..39b4096 100644
                                              ANDROID_SCALER_AVAILABLE_STREAM_CONFIGURATIONS_OUTPUT,
                                              ANDROID_SCALER_AVAILABLE_STREAM_CONFIGURATIONS,
                                              ANDROID_SCALER_AVAILABLE_MIN_FRAME_DURATIONS,
-@@ -807,137 +744,22 @@ status_t ExternalCameraDevice::calculateMinFps(
+@@ -807,137 +740,22 @@ status_t ExternalCameraDevice::calculateMinFps(
  #undef ARRAY_SIZE
  #undef UPDATE
  
@@ -608,7 +619,7 @@ index bcae194..a848a06 100644
      std::vector<SupportedV4L2Format> mSupportedFormats;
      CroppingType mCroppingType;
 diff --git a/camera/ExternalCameraDeviceSession.cpp b/camera/ExternalCameraDeviceSession.cpp
-index 4e90a67..74c5947 100644
+index 4e90a67..779fba4 100644
 --- a/camera/ExternalCameraDeviceSession.cpp
 +++ b/camera/ExternalCameraDeviceSession.cpp
 @@ -33,6 +33,7 @@
@@ -619,7 +630,7 @@ index 4e90a67..74c5947 100644
  #include <convert.h>
  #include <linux/videodev2.h>
  #include <sync/sync.h>
-@@ -54,12 +55,7 @@ namespace {
+@@ -54,12 +55,16 @@ namespace {
  // Size of request/result metadata fast message queue. Change to 0 to always use hwbinder buffer.
  static constexpr size_t kMetadataMsgQueueSize = 1 << 18 /* 256kB */;
  
@@ -630,10 +641,19 @@ index 4e90a67..74c5947 100644
 -                               // webcam showing temporarily ioctl failures.
 -constexpr int IOCTL_RETRY_SLEEP_US = 33000;  // 33ms * MAX_RETRY = 0.5 seconds
 +constexpr auto kHostFrameTimeout = std::chrono::seconds(3);
++
++// Closes the acquire fences imported for the first `count` buffers.
++void closeAcquireFences(const std::vector<HalStreamBuffer>& buffers, size_t count) {
++    for (size_t i = 0; i < count; i++) {
++        if (buffers[i].acquireFence >= 0) {
++            close(buffers[i].acquireFence);
++        }
++    }
++}
  
  // Constants for tryLock during dumpstate
  static constexpr int kDumpLockRetries = 50;
-@@ -114,14 +110,14 @@ ExternalCameraDeviceSession::ExternalCameraDeviceSession(
+@@ -114,14 +119,14 @@ ExternalCameraDeviceSession::ExternalCameraDeviceSession(
          const std::shared_ptr<ICameraDeviceCallback>& callback, const ExternalCameraConfig& cfg,
          const std::vector<SupportedV4L2Format>& sortedFormats, const CroppingType& croppingType,
          const common::V1_0::helper::CameraMetadata& chars, const std::string& cameraId,
@@ -650,7 +670,7 @@ index 4e90a67..74c5947 100644
        mMaxThumbResolution(getMaxThumbResolution()),
        mMaxJpegResolution(getMaxJpegResolution()) {}
  
-@@ -140,38 +136,8 @@ Size ExternalCameraDeviceSession::getMaxJpegResolution() const {
+@@ -140,38 +145,8 @@ Size ExternalCameraDeviceSession::getMaxJpegResolution() const {
  }
  
  bool ExternalCameraDeviceSession::initialize() {
@@ -691,7 +711,18 @@ index 4e90a67..74c5947 100644
  
      initOutputThread();
      if (mOutputThread == nullptr) {
-@@ -437,7 +403,7 @@ ScopedAStatus ExternalCameraDeviceSession::configureStreams(
+@@ -217,8 +192,8 @@ void ExternalCameraDeviceSession::initOutputThread() {
+     // Grab a shared_ptr to 'this' from ndk::SharedRefBase::ref()
+     std::shared_ptr<ExternalCameraDeviceSession> thiz = ref<ExternalCameraDeviceSession>();
+ 
+-    mBufferRequestThread = std::make_shared<BufferRequestThread>(/*parent=*/thiz, mCallback);
+-    mBufferRequestThread->run();
++    // cameraserver hands each request its buffers (no HAL buffer manager), so
++    // there is no BufferRequestThread.
+     mOutputThread = std::make_shared<OutputThread>(/*parent=*/thiz, mCroppingType,
+                                                    mCameraCharacteristics, mBufferRequestThread);
+ }
+@@ -437,7 +412,7 @@ ScopedAStatus ExternalCameraDeviceSession::configureStreams(
                                           ((int64_t)BufferUsage::CPU_WRITE_OFTEN) |
                                           ((int64_t)BufferUsage::CAMERA_OUTPUT));
          out[i].consumerUsage = static_cast<BufferUsage>(0);
@@ -700,7 +731,7 @@ index 4e90a67..74c5947 100644
  
          switch (in_requestedConfiguration.streams[i].format) {
              case PixelFormat::BLOB:
-@@ -641,7 +607,7 @@ Status ExternalCameraDeviceSession::processOneCaptureRequest(const CaptureReques
+@@ -641,7 +616,7 @@ Status ExternalCameraDeviceSession::processOneCaptureRequest(const CaptureReques
      }
  
      nsecs_t shutterTs = 0;
@@ -709,7 +740,38 @@ index 4e90a67..74c5947 100644
      if (frameIn == nullptr) {
          ALOGE("%s: V4L2 deque frame failed!", __FUNCTION__);
          return Status::INTERNAL_ERROR;
-@@ -817,10 +783,9 @@ Status ExternalCameraDeviceSession::switchToOffline(
+@@ -662,9 +637,28 @@ Status ExternalCameraDeviceSession::processOneCaptureRequest(const CaptureReques
+         halBuf.height = stream.height;
+         halBuf.format = stream.format;
+         halBuf.usage = stream.usage;
+-        halBuf.bufPtr = nullptr;  // threadloop will request buffer from cameraservice
+-        halBuf.acquireFence = 0;  // threadloop will request fence from cameraservice
++        halBuf.bufPtr = nullptr;
++        halBuf.acquireFence = -1;
+         halBuf.fenceTimeout = false;
++        native_handle_t* h = makeFromAidl(request.outputBuffers[i].buffer);
++        Status s = importBuffer(streamId, halBuf.bufferId, h, &halBuf.bufPtr);
++        native_handle_delete(h);
++        if (s != Status::OK) {
++            ALOGE("%s: stream %d buffer %" PRId64 " import failed", __FUNCTION__, streamId,
++                  halBuf.bufferId);
++            closeAcquireFences(halReq->buffers, i);
++            enqueueV4l2Frame(std::static_pointer_cast<HostFrame>(halReq->frameIn));
++            return s;
++        }
++        h = makeFromAidl(request.outputBuffers[i].acquireFence);
++        bool fenceOk = sHandleImporter.importFence(h, halBuf.acquireFence);
++        native_handle_delete(h);
++        if (!fenceOk) {
++            ALOGE("%s: stream %d acquire fence import failed", __FUNCTION__, streamId);
++            closeAcquireFences(halReq->buffers, i);
++            enqueueV4l2Frame(std::static_pointer_cast<HostFrame>(halReq->frameIn));
++            return Status::INTERNAL_ERROR;
++        }
+     }
+     {
+         std::lock_guard<std::mutex> lk(mInflightFramesLock);
+@@ -817,10 +811,9 @@ Status ExternalCameraDeviceSession::switchToOffline(
          offlineReqs[i]->setting = v4lReq->setting;
          offlineReqs[i]->shutterTs = v4lReq->shutterTs;
          offlineReqs[i]->buffers = v4lReq->buffers;
@@ -722,7 +784,7 @@ index 4e90a67..74c5947 100644
          enqueueV4l2Frame(v4l2Frame);
      }
  
-@@ -1055,60 +1020,10 @@ int ExternalCameraDeviceSession::configureV4l2StreamLocked(const SupportedV4L2Fo
+@@ -1055,60 +1048,10 @@ int ExternalCameraDeviceSession::configureV4l2StreamLocked(const SupportedV4L2Fo
      ATRACE_CALL();
      int ret = v4l2StreamOffLocked();
      if (ret != OK) {
@@ -784,7 +846,7 @@ index 4e90a67..74c5947 100644
      const double kDefaultFps = 30.0;
      double fps = std::numeric_limits<double>::max();
      if (requestFps != 0.0) {
-@@ -1131,101 +1046,27 @@ int ExternalCameraDeviceSession::configureV4l2StreamLocked(const SupportedV4L2Fo
+@@ -1131,101 +1074,27 @@ int ExternalCameraDeviceSession::configureV4l2StreamLocked(const SupportedV4L2Fo
          }
      }
  
@@ -872,15 +934,15 @@ index 4e90a67..74c5947 100644
 -            ALOGE("%s: DQBUF fails: %s", __FUNCTION__, strerror(errno));
 -            return -errno;
 -        }
--
++    mMaxLagNs = deckard::kHostFrames * 1000000000LL * 2 / fps;
++    mV4L2BufferCount = deckard::kHostFrames;
+ 
 -        if (TEMP_FAILURE_RETRY(ioctl(mV4l2Fd.get(), VIDIOC_QBUF, &buffer)) < 0) {
 -            ALOGE("%s: QBUF index %d fails: %s", __FUNCTION__, buffer.index, strerror(errno));
 -            return -errno;
 -        }
 -    }
-+    mMaxLagNs = deckard::kHostFrames * 1000000000LL * 2 / fps;
-+    mV4L2BufferCount = deckard::kHostFrames;
- 
+-
 -    ALOGI("%s: start V4L2 streaming %dx%d@%ffps", __FUNCTION__, v4l2Fmt.width, v4l2Fmt.height, fps);
 +    ALOGI("%s: start host stream %dx%d@%ffps", __FUNCTION__, v4l2Fmt.width, v4l2Fmt.height, fps);
      mV4l2StreamingFmt = v4l2Fmt;
@@ -897,7 +959,7 @@ index 4e90a67..74c5947 100644
      if (shutterTs == nullptr) {
          ALOGE("%s: shutterTs must not be null!", __FUNCTION__);
          return ret;
-@@ -1241,92 +1082,44 @@ std::unique_ptr<V4L2Frame> ExternalCameraDeviceSession::dequeueV4l2FrameLocked(n
+@@ -1241,92 +1110,44 @@ std::unique_ptr<V4L2Frame> ExternalCameraDeviceSession::dequeueV4l2FrameLocked(n
          }
      }
  
@@ -918,8 +980,10 @@ index 4e90a67..74c5947 100644
 -
 -        if (buffer.index >= mV4L2BufferCount) {
 -            ALOGE("%s: Invalid buffer id: %d", __FUNCTION__, buffer.index);
--            return ret;
--        }
++        if (!frame.has_value()) {
++            ALOGE("%s: no frame from the host", __FUNCTION__);
+             return ret;
+         }
 -
 -        if (buffer.flags & V4L2_BUF_FLAG_ERROR) {
 -            ALOGE("%s: v4l2 buf error! buf flag 0x%x", __FUNCTION__, buffer.flags);
@@ -929,10 +993,8 @@ index 4e90a67..74c5947 100644
 -        if (buffer.bytesused > mMaxV4L2BufferSize) {
 -            ALOGE("%s: v4l2 buffer bytes used: %u maximum %u", __FUNCTION__, buffer.bytesused,
 -                  mMaxV4L2BufferSize);
-+        if (!frame.has_value()) {
-+            ALOGE("%s: no frame from the host", __FUNCTION__);
-             return ret;
-         }
+-            return ret;
+-        }
 -
 -        nsecs_t curTimeNs = systemTime(SYSTEM_TIME_MONOTONIC);
 -
@@ -1014,7 +1076,7 @@ index 4e90a67..74c5947 100644
      {
          std::lock_guard<std::mutex> lk(mV4l2BufferLock);
          mNumDequeuedV4l2Buffers--;
-@@ -1427,8 +1220,7 @@ void ExternalCameraDeviceSession::closeImpl() {
+@@ -1427,8 +1248,7 @@ void ExternalCameraDeviceSession::closeImpl() {
              }
          }
          v4l2StreamOffLocked();
@@ -1024,7 +1086,7 @@ index 4e90a67..74c5947 100644
          mClosed = true;
      }
  }
-@@ -1452,70 +1244,21 @@ int ExternalCameraDeviceSession::v4l2StreamOffLocked() {
+@@ -1452,70 +1272,21 @@ int ExternalCameraDeviceSession::v4l2StreamOffLocked() {
      {
          std::lock_guard<std::mutex> lk(mV4l2BufferLock);
          if (mNumDequeuedV4l2Buffers != 0) {
@@ -1099,7 +1161,7 @@ index 4e90a67..74c5947 100644
  void ExternalCameraDeviceSession::cleanupInflightFences(std::vector<int>& allFences,
                                                          size_t numFences) {
      for (size_t j = 0; j < numFences; j++) {
-@@ -1732,7 +1475,7 @@ Status ExternalCameraDeviceSession::processCaptureRequestError(
+@@ -1732,7 +1503,7 @@ Status ExternalCameraDeviceSession::processCaptureRequestError(
          std::vector<CaptureResult>* outResults) {
      ATRACE_CALL();
      // Return V4L2 buffer to V4L2 buffer queue
@@ -1108,7 +1170,7 @@ index 4e90a67..74c5947 100644
      enqueueV4l2Frame(v4l2Frame);
  
      if (outMsgs == nullptr) {
-@@ -1790,7 +1533,7 @@ Status ExternalCameraDeviceSession::processCaptureRequestError(
+@@ -1790,7 +1561,7 @@ Status ExternalCameraDeviceSession::processCaptureRequestError(
  Status ExternalCameraDeviceSession::processCaptureResult(std::shared_ptr<HalRequest>& req) {
      ATRACE_CALL();
      // Return V4L2 buffer to V4L2 buffer queue
@@ -1117,7 +1179,7 @@ index 4e90a67..74c5947 100644
      enqueueV4l2Frame(v4l2Frame);
  
      // NotifyShutter
-@@ -1922,8 +1665,8 @@ binder_status_t ExternalCameraDeviceSession::dump(int fd, const char** /*args*/,
+@@ -1922,8 +1693,8 @@ binder_status_t ExternalCameraDeviceSession::dump(int fd, const char** /*args*/,
          }
      }
  
@@ -1128,7 +1190,7 @@ index 4e90a67..74c5947 100644
              streaming ? "streaming" : "not streaming");
  
      if (streaming) {
-@@ -2778,8 +2521,8 @@ bool ExternalCameraDeviceSession::OutputThread::threadLoop() {
+@@ -2778,8 +2549,8 @@ bool ExternalCameraDeviceSession::OutputThread::threadLoop() {
          return false;
      };
  
@@ -1139,7 +1201,7 @@ index 4e90a67..74c5947 100644
                               req->frameIn->mFourcc & 0xFF, (req->frameIn->mFourcc >> 8) & 0xFF,
                               (req->frameIn->mFourcc >> 16) & 0xFF,
                               (req->frameIn->mFourcc >> 24) & 0xFF);
-@@ -2792,13 +2535,12 @@ bool ExternalCameraDeviceSession::OutputThread::threadLoop() {
+@@ -2792,13 +2563,12 @@ bool ExternalCameraDeviceSession::OutputThread::threadLoop() {
      }
  
      std::unique_lock<std::mutex> lk(mBufferLock);
@@ -1155,7 +1217,7 @@ index 4e90a67..74c5947 100644
      }
  
      // Process camera mute state
-@@ -2825,9 +2567,8 @@ bool ExternalCameraDeviceSession::OutputThread::threadLoop() {
+@@ -2825,9 +2595,8 @@ bool ExternalCameraDeviceSession::OutputThread::threadLoop() {
          }
      }
  
@@ -1167,7 +1229,7 @@ index 4e90a67..74c5947 100644
          res = 0;
          if (mCameraMuted) {
              res = libyuv::ConvertToI420(
-@@ -2838,18 +2579,19 @@ bool ExternalCameraDeviceSession::OutputThread::threadLoop() {
+@@ -2838,18 +2607,19 @@ bool ExternalCameraDeviceSession::OutputThread::threadLoop() {
                      mYu12Frame->mWidth, mYu12Frame->mHeight, mYu12Frame->mWidth,
                      mYu12Frame->mHeight, libyuv::kRotate0, libyuv::FOURCC_RAW);
          } else {
@@ -2460,15 +2522,25 @@ diff --git a/camera/external-service.cpp b/camera/service.cpp
 similarity index 76%
 rename from camera/external-service.cpp
 rename to camera/service.cpp
-index b18f182..be26aab 100644
+index b18f182..0922b26 100644
 --- a/camera/external-service.cpp
 +++ b/camera/service.cpp
-@@ -27,25 +27,18 @@ const int HWBINDER_THREAD_COUNT = 6;
+@@ -18,6 +18,7 @@
+ #include <android-base/logging.h>
+ #include <android/binder_manager.h>
+ #include <android/binder_process.h>
++#include <signal.h>
+ 
+ using ::android::hardware::camera::provider::implementation::ExternalCameraProvider;
+ 
+@@ -27,25 +28,20 @@ const int HWBINDER_THREAD_COUNT = 6;
  }  // namespace
  
  int main() {
 -    ALOGI("CameraProvider: external webcam service is starting.");
 +    ALOGI("CameraProvider: Deckard host camera service is starting.");
++    // dumpsys writes to a pipe its caller may close; that must not kill the provider.
++    signal(SIGPIPE, SIG_IGN);
  
      ABinderProcess_setThreadPoolMaxThreadCount(HWBINDER_THREAD_COUNT);
  
