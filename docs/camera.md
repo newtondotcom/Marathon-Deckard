@@ -111,17 +111,21 @@ provider reconnects.
 running as `cameraserver`. The fork keeps the AOSP code and changes:
 
 - **Enumeration.** Cameras come from `CAMERAS`, not `/dev/video*` and
-  inotify. Device names are `device@1.1/internal/<n>`, back camera first, so
-  the old Camera API's ids 0 and 1 are back and front.
+  inotify. Device names are `device@1.1/deckard/<n>` (cameraserver wants the
+  provider instance's type), back camera first, so the old Camera API's ids
+  0 and 1 are back and front.
 - **Characteristics.** `LENS_FACING` from `Location`; `SENSOR_ORIENTATION`
   from `Rotation` (libcamera's own Android layer maps them the same way);
   hardware level EXTERNAL; `BACKWARD_COMPATIBLE`; outputs YUV_420_888,
-  IMPLEMENTATION_DEFINED (PRIVATE) and BLOB (JPEG) at every host size and the
-  smaller sizes the HAL crops and scales to; AE target FPS ranges from the
-  host sizes' rates.
-- **Frames.** `RGBA` from the socket is converted once to the HAL's I420
-  working frame with libyuv (`ABGRToI420`), replacing the MJPEG decode; the
-  rest (crop, scale, YUV and JPEG outputs, EXIF) is AOSP's.
+  IMPLEMENTATION_DEFINED (PRIVATE) and BLOB (JPEG) at every host size (the
+  HAL crops and scales its working frame to each stream); AE target FPS
+  ranges from the host sizes' rates.
+- **Frames.** `RGBA` from the socket is converted once to the HAL's
+  full-range I420 working frame with libyuv (`ABGRToJ420`), replacing the
+  MJPEG decode, and the dma-buf goes back to the host right after; the rest
+  (crop, scale, YUV and JPEG outputs, EXIF) is AOSP's. At most two requests
+  hold host frames; each stream still gets four buffers from cameraserver
+  (the HAL buffer manager), since the preview's consumer keeps some.
 - **Timestamps.** The host's CLOCK_MONOTONIC capture time, reported as
   `SENSOR_INFO_TIMESTAMP_SOURCE_UNKNOWN`, as the external HAL does.
 
