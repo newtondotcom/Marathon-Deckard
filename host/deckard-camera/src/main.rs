@@ -65,7 +65,11 @@ fn listen_at(path: &Path) -> Result<OwnedFd, Error> {
 }
 
 /// Serves the socket until its path stops naming it (an Android data reset).
-fn serve(listener: &OwnedFd, path: &Path, cameras: &Arc<Vec<probe::Camera>>) -> Result<(), Error> {
+fn serve(
+    listener: &OwnedFd,
+    path: &Path,
+    cameras: &mut Arc<Vec<probe::Camera>>,
+) -> Result<(), Error> {
     let ours = identity(path);
     let timeout = Timespec::try_from(CHECK)?;
     loop {
@@ -82,6 +86,11 @@ fn serve(listener: &OwnedFd, path: &Path, cameras: &Arc<Vec<probe::Camera>>) -> 
             eprintln!("deckard-camera: refused UID {uid}");
             continue;
         }
+        // libcamera finds no cameras while another process streams from the
+        // shared media device, so an empty list is probed again.
+        if cameras.is_empty() {
+            *cameras = Arc::new(probe::cameras());
+        }
         let cameras = Arc::clone(cameras);
         thread::spawn(move || {
             if let Err(failure) = session::serve(socket, &cameras)
@@ -96,7 +105,7 @@ fn serve(listener: &OwnedFd, path: &Path, cameras: &Arc<Vec<probe::Camera>>) -> 
 fn main() -> Result<(), Error> {
     let path = data_dir()?.join("deckard/camera.sock");
     gst::init()?;
-    let cameras = Arc::new(probe::cameras());
+    let mut cameras = Arc::new(probe::cameras());
     loop {
         if path.parent().is_some_and(Path::is_dir) {
             let listener = listen_at(&path)?;
@@ -105,7 +114,7 @@ fn main() -> Result<(), Error> {
                 cameras.len(),
                 path.display()
             );
-            serve(&listener, &path, &cameras)?;
+            serve(&listener, &path, &mut cameras)?;
         } else {
             thread::sleep(CHECK);
         }
