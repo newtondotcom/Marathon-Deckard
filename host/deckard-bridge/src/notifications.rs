@@ -348,6 +348,8 @@ impl Notifications {
             }
             Some("NotificationClosed") => {
                 let (id, reason): (u32, u32) = body.deserialize()?;
+                // Before the save, whose fsyncs can take seconds on a busy disk.
+                let closed = Instant::now();
                 let Some(key) = state.keys.remove(&id) else {
                     return Ok(());
                 };
@@ -358,10 +360,8 @@ impl Notifications {
                 if reason == 2 {
                     let token = state.next_token;
                     state.next_token = token.wrapping_add(1);
-                    state
-                        .closing
-                        .insert(id, (key, entry, token, Instant::now()));
-                    let due = (Instant::now() + DISMISS_DELAY, id, token);
+                    state.closing.insert(id, (key, entry, token, closed));
+                    let due = (closed + DISMISS_DELAY, id, token);
                     if let Err(TrySendError::Full(_)) = self.0.dismissals.try_send(due) {
                         eprintln!("deckard-bridge: too many dismissals; {id} stays");
                     }
