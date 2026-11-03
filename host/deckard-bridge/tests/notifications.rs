@@ -18,6 +18,9 @@ type TestResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 const HUB: &str = "org.freedesktop.Notifications";
 const PATH: &str = "/org/freedesktop/Notifications";
+/// How long an expected event may take: each state save fsyncs twice, which
+/// takes seconds on a builder's busy disk.
+const EVENT_WAIT: Duration = Duration::from_secs(15);
 
 struct PrivateBus {
     daemon: Child,
@@ -129,13 +132,13 @@ impl FakeHub {
     }
 }
 
-/// The saved state once it equals `want`, or as it is after five seconds:
+/// The saved state once it equals `want`, or as it is after `EVENT_WAIT`:
 /// the close signal is handled on the bridge's own thread.
 fn saved_settles(
     path: &std::path::Path,
     want: &serde_json::Value,
 ) -> TestResult<serde_json::Value> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + EVENT_WAIT;
     loop {
         let saved = serde_json::from_slice(&std::fs::read(path)?)?;
         if &saved == want || std::time::Instant::now() > deadline {
@@ -265,7 +268,7 @@ fn private_bus_actions_replies_and_dismissal_timing() -> TestResult<()> {
         &(41_u32, "Hello"),
     ))?;
     assert_eq!(
-        rx.recv_timeout(Duration::from_secs(2))?,
+        rx.recv_timeout(EVENT_WAIT)?,
         json!({"t": "reply", "key": "tap", "action": "a1", "text": "Hello"})
     );
     // The tap's grace counts from the tap: the close follows it at once so
@@ -278,7 +281,7 @@ fn private_bus_actions_replies_and_dismissal_timing() -> TestResult<()> {
         &(41_u32, "default"),
     ))?;
     assert_eq!(
-        rx.recv_timeout(Duration::from_secs(2))?,
+        rx.recv_timeout(EVENT_WAIT)?,
         json!({"t": "invoke", "key": "tap", "action": "default"})
     );
     zbus::block_on(hub.emit_signal(
@@ -306,7 +309,7 @@ fn private_bus_actions_replies_and_dismissal_timing() -> TestResult<()> {
         &(42_u32, 2_u32),
     ))?;
     assert_eq!(
-        rx.recv_timeout(Duration::from_secs(2))?,
+        rx.recv_timeout(EVENT_WAIT)?,
         json!({"t": "dismiss", "key": "dismiss"})
     );
     Ok(())
