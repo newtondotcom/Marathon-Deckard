@@ -1,0 +1,152 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: patrickjquinn <patrick.jm.quinn@gmail.com>
+Date: Tue, 3 Nov 2026 10:57:29 +0000
+Subject: [PATCH] camera: Give previews RGBA straight from the host frame
+
+PRIVATE streams that are not for a video encoder now take RGBA_8888.
+The host's frame is RGBA already, so a preview frame costs one crop and
+scale (or a copy) into Android's buffer, and a request with only previews
+skips the YU12 working frame altogether; YUV, JPEG and encoder streams go
+through YU12 as before. A muted camera's pattern still comes from YU12.
+---
+ camera/ExternalCameraDeviceSession.cpp | 79 +++++++++++++++++++++++---
+ camera/ExternalCameraDeviceSession.h   |  2 +
+ 2 files changed, 74 insertions(+), 7 deletions(-)
+
+diff --git a/camera/ExternalCameraDeviceSession.cpp b/camera/ExternalCameraDeviceSession.cpp
+index 779fba4..eafe469 100644
+--- a/camera/ExternalCameraDeviceSession.cpp
++++ b/camera/ExternalCameraDeviceSession.cpp
+@@ -423,11 +423,13 @@ ScopedAStatus ExternalCameraDeviceSession::configureStreams(
+                 out[i].overrideFormat = in_requestedConfiguration.streams[i].format;
+                 break;
+             case PixelFormat::IMPLEMENTATION_DEFINED:
+-                // Implementation Defined
+-                // This should look at the Stream's dataspace flag to determine the format or leave
+-                // it as is if the rest of the system knows how to handle a private format. To keep
+-                // this HAL generic, this is being overridden to YUV420
+-                out[i].overrideFormat = PixelFormat::YCBCR_420_888;
++                // The host's frames are RGBA: a preview takes them with one copy. A video
++                // encoder gets YUV420, which every encoder takes.
++                out[i].overrideFormat =
++                        (static_cast<int64_t>(in_requestedConfiguration.streams[i].usage) &
++                         static_cast<int64_t>(BufferUsage::VIDEO_ENCODER))
++                                ? PixelFormat::YCBCR_420_888
++                                : PixelFormat::RGBA_8888;
+                 // Save overridden format in mStreamMap
+                 mStreamMap[in_requestedConfiguration.streams[i].id].format = out[i].overrideFormat;
+                 break;
+@@ -2155,6 +2157,34 @@ void ExternalCameraDeviceSession::OutputThread::signalRequestDone() {
+     mRequestDoneCond.notify_one();
+ }
+ 
++// One RGBA output: the host frame (or, muted, the YU12 pattern) cropped to the
++// output's aspect ratio and scaled into it.
++int ExternalCameraDeviceSession::OutputThread::writeRgbaLocked(const uint8_t* in, size_t inSize,
++                                                               uint8_t* out, uint32_t outStride,
++                                                               const Size& outSz) {
++    Size inSz = {mYu12Frame->mWidth, mYu12Frame->mHeight};
++    IMapper::Rect crop;
++    if (getCropRect(mCroppingType, inSz, outSz, &crop) != 0) {
++        ALOGE("%s: no crop for %dx%d", __FUNCTION__, outSz.width, outSz.height);
++        return -1;
++    }
++    if (mCameraMuted) {
++        YCbCrLayout yuv;
++        if (cropAndScaleLocked(mYu12Frame, outSz, &yuv) != 0)
++            return -1;
++        return libyuv::I420ToABGR(static_cast<uint8_t*>(yuv.y), yuv.yStride,
++                                  static_cast<uint8_t*>(yuv.cb), yuv.cStride,
++                                  static_cast<uint8_t*>(yuv.cr), yuv.cStride, out, outStride,
++                                  outSz.width, outSz.height);
++    }
++    const size_t inStride = inSize / inSz.height;
++    const uint8_t* src = in + crop.top * inStride + crop.left * 4;
++    if (crop.width == outSz.width && crop.height == outSz.height)
++        return libyuv::ARGBCopy(src, inStride, out, outStride, outSz.width, outSz.height);
++    return libyuv::ARGBScale(src, inStride, crop.width, crop.height, out, outStride, outSz.width,
++                             outSz.height, libyuv::kFilterBilinear);
++}
++
+ int ExternalCameraDeviceSession::OutputThread::cropAndScaleLocked(
+         std::shared_ptr<AllocatedFrame>& in, const Size& outSz, YCbCrLayout* out) {
+     Size inSz = {in->mWidth, in->mHeight};
+@@ -2595,7 +2625,18 @@ bool ExternalCameraDeviceSession::OutputThread::threadLoop() {
+         }
+     }
+ 
+-    {
++    // RGBA outputs are scaled straight from the host frame; YU12 is made only
++    // for the others (YUV, JPEG) or for a muted camera's pattern.
++    bool needsYu12 = mCameraMuted;
++    bool hasRgba = false;
++    for (const auto& halBuf : req->buffers) {
++        if (halBuf.format == PixelFormat::RGBA_8888)
++            hasRgba = true;
++        else
++            needsYu12 = true;
++    }
++
++    if (needsYu12) {
+         ATRACE_BEGIN("ABGRToJ420");
+         res = 0;
+         if (mCameraMuted) {
+@@ -2616,7 +2657,8 @@ bool ExternalCameraDeviceSession::OutputThread::threadLoop() {
+         }
+         ATRACE_END();
+         // The frame is in mYu12Frame now; the host can reuse its buffer.
+-        std::static_pointer_cast<HostFrame>(req->frameIn)->release();
++        if (!hasRgba)
++            std::static_pointer_cast<HostFrame>(req->frameIn)->release();
+ 
+         if (res != 0) {
+             ALOGE("%s: Convert host frame to YU12 failed! res %d", __FUNCTION__, res);
+@@ -2746,12 +2788,35 @@ bool ExternalCameraDeviceSession::OutputThread::threadLoop() {
+                     halBuf.acquireFence = relFence;
+                 }
+             } break;
++            case PixelFormat::RGBA_8888: {
++                uint32_t stride = 0;
++                if (sHandleImporter.getMonoPlanarStrideBytes(*(halBuf.bufPtr), &stride) != OK) {
++                    lk.unlock();
++                    return onDeviceError("%s: RGBA buffer stride unknown", __FUNCTION__);
++                }
++                android::Rect outRect{0, 0, static_cast<int32_t>(halBuf.width),
++                                      static_cast<int32_t>(halBuf.height)};
++                auto* out = static_cast<uint8_t*>(sHandleImporter.lock(
++                        *(halBuf.bufPtr), static_cast<uint64_t>(halBuf.usage), outRect));
++                int ret = out == nullptr ? -1
++                                         : writeRgbaLocked(inData, inDataSize, out, stride,
++                                                           Size{halBuf.width, halBuf.height});
++                int relFence = sHandleImporter.unlock(*(halBuf.bufPtr));
++                if (relFence >= 0) {
++                    halBuf.acquireFence = relFence;
++                }
++                if (ret != 0) {
++                    lk.unlock();
++                    return onDeviceError("%s: RGBA output failed", __FUNCTION__);
++                }
++            } break;
+             default:
+                 lk.unlock();
+                 return onDeviceError("%s: unknown output format %x", __FUNCTION__, halBuf.format);
+         }
+     }  // for each buffer
+     mScaledYu12Frames.clear();
++    std::static_pointer_cast<HostFrame>(req->frameIn)->release();
+ 
+     // Don't hold the lock while calling back to parent
+     lk.unlock();
+diff --git a/camera/ExternalCameraDeviceSession.h b/camera/ExternalCameraDeviceSession.h
+index 107426d..278caff 100644
+--- a/camera/ExternalCameraDeviceSession.h
++++ b/camera/ExternalCameraDeviceSession.h
+@@ -194,6 +194,8 @@ class ExternalCameraDeviceSession : public BnCameraDeviceSession, public OutputT
+         void waitForNextRequest(std::shared_ptr<HalRequest>* out);
+         void signalRequestDone();
+ 
++        int writeRgbaLocked(const uint8_t* in, size_t inSize, uint8_t* out, uint32_t outStride,
++                            const Size& outSz);
+         int cropAndScaleLocked(std::shared_ptr<AllocatedFrame>& in, const Size& outSize,
+                                YCbCrLayout* out);
+ 
