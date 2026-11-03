@@ -196,10 +196,7 @@ pub fn open_device_access(dev: &Path, debug_sync: &Path) -> Result<()> {
     ];
     let mut nodes: Vec<PathBuf> = fixed.iter().map(|name| dev.join(name)).collect();
     nodes.push(debug_sync.to_owned());
-    for (directory, prefix) in [
-        (dev.join("dri"), "renderD"),
-        (dev.join("dma_heap"), ""),
-    ] {
+    for (directory, prefix) in [(dev.join("dri"), "renderD"), (dev.join("dma_heap"), "")] {
         nodes.extend(matching(&directory, prefix)?);
     }
     for node in nodes {
