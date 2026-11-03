@@ -196,3 +196,22 @@ Nothing here was changed in libcamera or the kernel.
 - **Rear 1920×1080 through `deckard-camera`:** 29.2 fps, first frame 367 ms
   after `START`, capture-to-client latency median 36 ms, p95 96 ms (frame
   PTS plus base time against CLOCK_MONOTONIC at receipt).
+
+## Verified on the Q25 (2026-11-03, kernel f2)
+
+F-Droid's Open Camera (`net.sourceforge.opencamera`, version code 96) through
+Deckard, Marathon Camera alongside:
+
+| Check | Result |
+|---|---|
+| Cameras | 2: back (facing back, orientation 90), front (front, 270), EXTERNAL level |
+| Back preview in Marathon | shown; 22.9 fps in Android (host limit about 24 at 12.5 MP) |
+| Front preview in Marathon | shown; 30.2 fps |
+| Stills | JPEG from both (1920x1080 back, 1276x720 front) |
+| Marathon Camera brought in front of Open Camera | Open Camera closes on pause; Marathon Camera previews at once |
+| Open Camera brought in front of Marathon Camera | opens after Marathon Camera lets go (the open waits up to 1.5 s) |
+| Host to client latency (rear 1920x1080, `deckard-camera` alone) | median 36 ms, p95 96 ms |
+
+Open: JPEG EXIF orientation (1 on both test photos, taken lying flat;
+Open Camera derives it from the accelerometer), a rotated video through the
+composer patch (the image has no video player), video recording.
