@@ -124,8 +124,11 @@ running as `cameraserver`. The fork keeps the AOSP code and changes:
   full-range I420 working frame with libyuv (`ABGRToJ420`), replacing the
   MJPEG decode, and the dma-buf goes back to the host right after; the rest
   (crop, scale, YUV and JPEG outputs, EXIF) is AOSP's. At most two requests
-  hold host frames; each stream still gets four buffers from cameraserver
-  (the HAL buffer manager), since the preview's consumer keeps some.
+  hold host frames; each stream gets four buffers.
+- **Buffers.** cameraserver hands each capture request its output buffers
+  and fences; the provider declares no buffer management version. The AOSP
+  HAL buffer manager path (`requestStreamBuffers` with a 132 ms wait) failed
+  on the Q25 whenever the preview's consumer was slow to return a buffer.
 - **Timestamps.** The host's CLOCK_MONOTONIC capture time, reported as
   `SENSOR_INFO_TIMESTAMP_SOURCE_UNKNOWN`, as the external HAL does.
 
@@ -148,6 +151,23 @@ runtime permission ([permissions.md](permissions.md)). cameraserver checks it
 before a client reaches the HAL. Marathon has no camera-in-use indicator yet;
 when it gets one, `deckard-camera` knows when the camera is streaming and for
 which open.
+
+## Showing the preview in Marathon
+
+Camera preview buffers reach Marathon through Deckard's composer HAL like
+any Android layer. Two composer faults hid them on the Q25, both fixed in
+image patch `hardware_deckard/0009` (shipped in the overlay until the image
+is rebuilt):
+
+- The preview layer carries the sensor's rotation as a layer transform.
+  Marathon's compositor (Qt Wayland 6.11) does not apply
+  `wl_surface.set_buffer_transform` (it keeps it as a content orientation)
+  and its viewporter rejects a source rectangle in transformed coordinates,
+  ending the composer's connection every frame. The composer now draws a
+  transformed layer into a copy, turned, and attaches that with no
+  transform.
+- The composer's copy for YUV frames was allocated tiled by minigbm on
+  Panfrost and then refused as not linear; it is allocated linear.
 
 ## Findings for the camera bring-up
 
