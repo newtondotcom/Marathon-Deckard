@@ -97,6 +97,18 @@ fn android_theming(bus: &Connection) -> Option<bool> {
         {
             Some(true)
         }
+        // zbus hands the standard names over as typed errors.
+        Err(zbus::Error::FDO(error))
+            if matches!(
+                *error,
+                zbus::fdo::Error::UnknownObject(_)
+                    | zbus::fdo::Error::UnknownInterface(_)
+                    | zbus::fdo::Error::UnknownMethod(_)
+                    | zbus::fdo::Error::UnknownProperty(_)
+            ) =>
+        {
+            Some(true)
+        }
         Err(error) => {
             eprintln!("deckard-bridge: cannot read the settings: {error}");
             None
