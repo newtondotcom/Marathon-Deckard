@@ -6,6 +6,10 @@ public class OverlayManagerTransaction {
             throw new RuntimeException("stub");
         }
 
+        public Builder unregisterFabricatedOverlay(OverlayIdentifier overlay) {
+            throw new RuntimeException("stub");
+        }
+
         public Builder setEnabled(OverlayIdentifier overlay, boolean enable, int userId) {
             throw new RuntimeException("stub");
         }

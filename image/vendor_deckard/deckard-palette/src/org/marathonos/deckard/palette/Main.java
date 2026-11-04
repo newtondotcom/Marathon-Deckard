@@ -2,6 +2,7 @@ package org.marathonos.deckard.palette;
 
 import android.content.om.FabricatedOverlay;
 import android.content.om.IOverlayManager;
+import android.content.om.OverlayIdentifier;
 import android.content.om.OverlayManagerTransaction;
 import android.os.ServiceManager;
 import android.util.TypedValue;
@@ -14,7 +15,8 @@ import java.io.IOException;
  * Applies deckardd's palette (/data/deckard/palette: "system_accent1_100
  * #ff7df0d4" per line) as one fabricated overlay on android, enabled above
  * DeckardPalette in a single transaction, so apps see one configuration
- * change. Runs under app_process as system.
+ * change. An empty palette removes the overlay, giving Android's own colours
+ * back. Runs under app_process as system.
  */
 public final class Main {
     private static final String OWNER = "android";
@@ -38,10 +40,15 @@ public final class Main {
             System.err.println("deckard-palette: " + e.getMessage());
             return;
         }
-        if (count == 0)
-            return;
-        FabricatedOverlay overlay = builder.build();
         IOverlayManager om = IOverlayManager.Stub.asInterface(ServiceManager.getService("overlay"));
+        if (count == 0) {
+            om.commit(new OverlayManagerTransaction.Builder()
+                    .unregisterFabricatedOverlay(new OverlayIdentifier(OWNER, NAME))
+                    .build());
+            System.out.println("deckard-palette: Android's own colours");
+            return;
+        }
+        FabricatedOverlay overlay = builder.build();
         om.commit(new OverlayManagerTransaction.Builder()
                 .registerFabricatedOverlay(overlay)
                 .setEnabled(overlay.getIdentifier(), true, 0)

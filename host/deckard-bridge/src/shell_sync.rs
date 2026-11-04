@@ -1,5 +1,6 @@
 //! Marathon state mirrored into Android's `/data/deckard`, where its
-//! deckard-watch service applies it: the ambience palette and Doze.
+//! deckard-watch service applies it: the ambience palette (empty when
+//! Settings switches Android's theming off) and Doze.
 
 use std::collections::HashMap;
 use std::fs;
@@ -18,6 +19,9 @@ const POWER_INTERFACE: &str = "org.marathonos.Shell.Power1";
 const AMBIENCE_PATH: &str = "/org/marathonos/Shell/Ambience";
 const AMBIENCE_INTERFACE: &str = "org.marathonos.Shell.Ambience1";
 const HIGHLIGHT: &str = "/desktop/jolla/theme/color/highlight";
+const SETTINGS_PATH: &str = "/org/marathonos/Shell/Settings";
+const SETTINGS_INTERFACE: &str = "org.marathonos.Shell.Settings1";
+const ANDROID_THEMING: &str = "androidTheming";
 
 type State = HashMap<String, OwnedValue>;
 
@@ -69,7 +73,46 @@ pub fn sync_doze(bus: &Connection, path: &Path) -> zbus::Result<()> {
     })
 }
 
+/// Settings' switch for Android's theming, on for a Shell without the
+/// switch; none when the Shell cannot be asked.
+fn android_theming(bus: &Connection) -> Option<bool> {
+    let reply = bus.call_method(
+        Some(SHELL_BUS_NAME),
+        SETTINGS_PATH,
+        Some(SETTINGS_INTERFACE),
+        "GetState",
+        &(),
+    );
+    match zbus::block_on(reply).and_then(|reply| reply.body().deserialize::<State>()) {
+        Ok(state) => Some(
+            state
+                .get(ANDROID_THEMING)
+                .and_then(|on| bool::try_from(on).ok())
+                .unwrap_or(true),
+        ),
+        Err(zbus::Error::MethodError(name, _, _))
+            if name
+                .as_str()
+                .starts_with("org.freedesktop.DBus.Error.Unknown") =>
+        {
+            Some(true)
+        }
+        Err(error) => {
+            eprintln!("deckard-bridge: cannot read the settings: {error}");
+            None
+        }
+    }
+}
+
 fn refresh_palette(bus: &Connection, path: &Path) {
+    match android_theming(bus) {
+        Some(true) => {}
+        Some(false) => {
+            write(path, "", "Android's own palette");
+            return;
+        }
+        None => return,
+    }
     let reply = bus.call_method(
         Some(SHELL_BUS_NAME),
         AMBIENCE_PATH,
@@ -98,14 +141,24 @@ fn refresh_palette(bus: &Connection, path: &Path) {
 }
 
 /// Writes Android's 65 system colours for the current ambience highlight to
-/// `path`, again whenever the ambience or the Shell's bus owner changes.
+/// `path`, or nothing while Android's theming is off, again whenever the
+/// ambience, that switch or the Shell's bus owner changes.
 ///
 /// # Errors
 /// Returns the D-Bus error that prevented the subscription.
 pub fn sync_palette(bus: &Connection, path: &Path) -> zbus::Result<()> {
     let ambience = crate::signals(SHELL_BUS_NAME, AMBIENCE_PATH, AMBIENCE_INTERFACE)?;
+    // The Shell sends settings signals from another of its connections, so
+    // the rule cannot name the Shell; the switch is read back from it anyway.
+    let theming = MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .path(SETTINGS_PATH)
+        .interface(SETTINGS_INTERFACE)
+        .member("PropertyChanged")
+        .add_arg(ANDROID_THEMING);
     let rules: Vec<(MatchRule<'static>, crate::Relevant)> = vec![
         (ambience.member("AmbienceChanged").build()?, |_| true),
+        (theming.build()?, |_| true),
         (crate::owner_changes(SHELL_BUS_NAME)?, |_| true),
     ];
     let (bus, path) = (bus.clone(), path.to_owned());
