@@ -1,0 +1,87 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: patrickjquinn <patrick.jm.quinn@gmail.com>
+Date: Mon, 2 Nov 2026 16:00:55 +0000
+Subject: [PATCH] deckard-preinit: Leave the host's nodes and mounts in a user
+ namespace
+
+When Deckard runs Android in a user namespace of its own, the host makes
+Android its own copies of the device nodes and LXC mounts cgroup2
+read-write and sysfs read-only. Android can create no nodes there and
+cannot remount superblocks the initial namespace owns, so replacing the
+bound nodes left /dev without null, zero or kmsg, and the cgroup2
+remount ended preinit with EPERM before it saved deckard.prop.
+
+Detect the namespace from /proc/self/uid_map and skip those three steps.
+---
+ deckard-preinit/main.cpp | 33 +++++++++++++++++++++++----------
+ 1 file changed, 23 insertions(+), 10 deletions(-)
+
+diff --git a/deckard-preinit/main.cpp b/deckard-preinit/main.cpp
+index 8758547..9b7f275 100644
+--- a/deckard-preinit/main.cpp
++++ b/deckard-preinit/main.cpp
+@@ -11,6 +11,7 @@
+ #include <algorithm>
+ #include <system_error>
+ #include <filesystem>
++#include <fstream>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+@@ -108,6 +109,16 @@ failed:
+     return false;
+ }
+ 
++// Whether Android runs in a user namespace of its own. The host then gave it
++// its own device nodes and mounted sysfs and cgroup2 as Android needs them,
++// and Android may neither create nodes nor remount the host's superblocks.
++static bool inOwnUserNamespace() {
++    std::ifstream map("/proc/self/uid_map");
++    unsigned long inside, outside, count;
++    if (!(map >> inside >> outside >> count)) return false;
++    return !(inside == 0 && outside == 0 && count == 4294967295UL);
++}
++
+ int main(int argc, char **argv) {
+     error_code     error;
+     vector<string> argsArray(argv, argv + argc);
+@@ -160,7 +171,7 @@ int main(int argc, char **argv) {
+         if (!moveDockerEtc()) return errno;
+     } else {
+         // Remove /dev bind-mounts for security
+-        DevNode::fixBindMountedNodes();
++        if (!inOwnUserNamespace()) DevNode::fixBindMountedNodes();
+ 
+         // Undo LXC /proc read-only layers (we will set up again later)
+         umount2("/proc/sys", MNT_DETACH);
+@@ -181,16 +192,18 @@ int main(int argc, char **argv) {
+         }
+     }
+ 
+-    // Remount /sys/fs/cgroup as read-write for cgroup functionality
+-    if (mount("none", "/sys/fs/cgroup", "cgroup2", MS_NODEV | MS_NOEXEC | MS_NOSUID | MS_REMOUNT, NULL) == -1) {
+-        Log::err("Failed to remount cgroup: {}", strerror(errno));
+-        return errno;
+-    }
++    if (!inOwnUserNamespace()) {
++        // Remount /sys/fs/cgroup as read-write for cgroup functionality
++        if (mount("none", "/sys/fs/cgroup", "cgroup2", MS_NODEV | MS_NOEXEC | MS_NOSUID | MS_REMOUNT, NULL) == -1) {
++            Log::err("Failed to remount cgroup: {}", strerror(errno));
++            return errno;
++        }
+ 
+-    // Remount /sys as read-only to prevent unexpected issues
+-    if (mount("sysfs", "/sys", "sysfs", MS_REMOUNT | MS_RDONLY, NULL) == -1) {
+-        Log::err("Failed to remount sysfs: {}", strerror(errno));
+-        return errno;
++        // Remount /sys as read-only to prevent unexpected issues
++        if (mount("sysfs", "/sys", "sysfs", MS_REMOUNT | MS_RDONLY, NULL) == -1) {
++            Log::err("Failed to remount sysfs: {}", strerror(errno));
++            return errno;
++        }
+     }
+ 
+     // Remount /proc/sysrq-trigger and /proc/sys (except /proc/sys/net) as read-only for security
+-- 
+2.55.0
+
