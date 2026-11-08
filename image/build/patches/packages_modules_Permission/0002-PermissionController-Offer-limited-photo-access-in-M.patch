@@ -1,0 +1,109 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: patrickjquinn <patrick.jm.quinn@gmail.com>
+Date: Mon, 2 Nov 2026 15:48:20 +0000
+Subject: [PATCH] PermissionController: Offer limited photo access in
+ Marathon's prompt
+
+Android 14's photo picker question (Allow limited access, Allow all,
+Don't allow) used to fall back to the handheld dialog for Deckard.
+MarathonGrantView now passes it to Marathon's prompt with "limited", which
+Marathon shows as an "Only photos I pick" switch, and maps the answer back
+to the button Android offered: GRANTED_USER_SELECTED (GrantPermissionsActivity
+then opens the photo picker), GRANTED_ALWAYS for all, and DENIED_MORE
+when the app already has some photos and asks for more.
+
+A DeckardSystem, deckard-bridge or shell that doesn't know "limited"
+leaves the switch out, and Allow means all.
+
+Change-Id: Ie0af351ff06105ecb44a7b243d102b0c2871677c
+---
+ .../deckard/permission/MarathonGrantView.java | 23 +++++++++++++------
+ 1 file changed, 16 insertions(+), 7 deletions(-)
+
+diff --git a/PermissionController/src/org/marathonos/deckard/permission/MarathonGrantView.java b/PermissionController/src/org/marathonos/deckard/permission/MarathonGrantView.java
+index fe762df..5625863 100644
+--- a/PermissionController/src/org/marathonos/deckard/permission/MarathonGrantView.java
++++ b/PermissionController/src/org/marathonos/deckard/permission/MarathonGrantView.java
+@@ -48,6 +48,8 @@ public final class MarathonGrantView implements GrantPermissionsViewHandler {
+     private static final int DENIED = 2;
+     private static final int DENIED_DO_NOT_ASK_AGAIN = 3;
+     private static final int GRANTED_ONE_TIME = 4;
++    private static final int GRANTED_USER_SELECTED = 5;
++    private static final int DENIED_MORE = 6;
+     private static final int ALLOW = 0;
+     private static final int ALLOW_FOREGROUND = 2;
+     private static final int DENY = 3;
+@@ -56,7 +58,9 @@ public final class MarathonGrantView implements GrantPermissionsViewHandler {
+     private static final int NO_UPGRADE_AND_DONT_ASK_AGAIN = 7;
+     private static final int NO_UPGRADE_OT_AND_DONT_ASK_AGAIN = 9;
+     private static final int LINK_TO_SETTINGS = 10;
++    private static final int ALLOW_ALL = 11;
+     private static final int ALLOW_SELECTED = 12;
++    private static final int DONT_ALLOW_MORE_SELECTED = 13;
+     private static final int BUTTONS = 16;
+     private static final int LOCATIONS = 7;
+     private static final int LOCATION_ACCURACY = 0;
+@@ -179,16 +183,13 @@ public final class MarathonGrantView implements GrantPermissionsViewHandler {
+         mRationale = rationale;
+         mButtons = Arrays.copyOf(buttons, BUTTONS);
+         mLocation = Arrays.copyOf(location, LOCATIONS);
+-        // Marathon's prompt has no photo picker.
+-        if (mButtons[ALLOW_SELECTED])
+-            fallBack();
+         if (mFallback) {
+             mStock.updateUi(group, count, index, icon, message, detail, rationale, buttons, location);
+             return;
+         }
+         mActivity.getWindow().clearFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND);
+ 
+-        boolean canAllow = mButtons[ALLOW] || mButtons[ALLOW_FOREGROUND] || mButtons[ALLOW_ONE_TIME];
++        boolean canAllow = mButtons[ALLOW] || mButtons[ALLOW_ALL] || mButtons[ALLOW_FOREGROUND] || mButtons[ALLOW_ONE_TIME];
+         if (!canAllow && mButtons[LINK_TO_SETTINGS]) {
+             // Android asks for "all the time" only through its settings page,
+             // which DeckardSystem answers with Marathon's prompt. Asked again
+@@ -224,6 +225,7 @@ public final class MarathonGrantView implements GrantPermissionsViewHandler {
+         extras.putBoolean("once", mButtons[ALLOW_ONE_TIME]);
+         extras.putString("accuracy", mLocation[RADIO_GROUP] ? "choice" : mLocation[COARSE_ONLY] ? "approximate" : "");
+         extras.putBoolean("preciseDefault", mLocation[RADIO_GROUP] ? mLocation[FINE_RADIO] : mLocation[FINE_ONLY]);
++        extras.putBoolean("limited", mButtons[ALLOW_SELECTED]);
+         extras.putParcelable("receiver", forIpc(new ResultReceiver(mMain) {
+             @Override
+             protected void onReceiveResult(int code, Bundle data) {
+@@ -246,15 +248,16 @@ public final class MarathonGrantView implements GrantPermissionsViewHandler {
+         mPendingSignature = null;
+         String answer = data.getString("answer", "cancel");
+         boolean precise = data.getBoolean("precise");
++        boolean limited = data.getBoolean("limited") && mButtons[ALLOW_SELECTED];
+         switch (answer) {
+             case "allow":
+-                answerLater(allowResult(), affected(precise));
++                answerLater(limited ? GRANTED_USER_SELECTED : allowResult(), affected(precise));
+                 break;
+             case "once":
+                 answerLater(mButtons[ALLOW_ONE_TIME] ? GRANTED_ONE_TIME : allowResult(), affected(precise));
+                 break;
+             case "deny":
+-                answerLater(mButtons[DENY_AND_DONT_ASK_AGAIN] ? DENIED_DO_NOT_ASK_AGAIN : DENIED, affected(precise));
++                answerLater(denyResult(), affected(precise));
+                 break;
+             case "unsupported":
+                 fallBack();
+@@ -265,8 +268,14 @@ public final class MarathonGrantView implements GrantPermissionsViewHandler {
+         }
+     }
+ 
++    private int denyResult() {
++        if (mButtons[DONT_ALLOW_MORE_SELECTED])
++            return DENIED_MORE;
++        return mButtons[DENY_AND_DONT_ASK_AGAIN] ? DENIED_DO_NOT_ASK_AGAIN : DENIED;
++    }
++
+     private int allowResult() {
+-        if (mButtons[ALLOW])
++        if (mButtons[ALLOW] || mButtons[ALLOW_ALL])
+             return GRANTED_ALWAYS;
+         if (mButtons[ALLOW_FOREGROUND])
+             return GRANTED_FOREGROUND_ONLY;
+-- 
+2.55.0
+

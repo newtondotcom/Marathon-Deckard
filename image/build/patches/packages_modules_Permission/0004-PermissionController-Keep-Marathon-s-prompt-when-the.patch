@@ -1,0 +1,169 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: patrickjquinn <patrick.jm.quinn@gmail.com>
+Date: Mon, 2 Nov 2026 19:09:03 +0000
+Subject: [PATCH] PermissionController: Keep Marathon's prompt when the app's
+ dialog takes over
+
+When an app's own request takes over from the system's notification
+prompt (0003), the system dialog's MarathonGrantView withdrew its prompt
+on destroy and the new leader asked the same question again: two
+PromptAndroid calls, and the prompt could blink. The finishing dialog now
+hands its prompt over, and the new leader adopts it when it asks the same
+question (same app, group, buttons and location choices); otherwise it
+withdraws it as before. Answers go to whichever view holds the prompt.
+
+Checked on the Zinwa Q25 without this change: five F-Droid first launches
+with 0003 made two GrantPermissionsActivity starts, the second resumed
+110 ms after creation as the only leader, and Marathon got PromptAndroid
+twice for notifications.
+
+Change-Id: Ibcffc50755b1ac8ebd03a56e16220b808f600e02
+---
+ .../ui/GrantPermissionsActivity.java          |  5 ++
+ .../deckard/permission/MarathonGrantView.java | 67 +++++++++++++++++--
+ 2 files changed, 67 insertions(+), 5 deletions(-)
+
+diff --git a/PermissionController/src/com/android/permissioncontroller/permission/ui/GrantPermissionsActivity.java b/PermissionController/src/com/android/permissioncontroller/permission/ui/GrantPermissionsActivity.java
+index 75da0e2..e971d25 100644
+--- a/PermissionController/src/com/android/permissioncontroller/permission/ui/GrantPermissionsActivity.java
++++ b/PermissionController/src/com/android/permissioncontroller/permission/ui/GrantPermissionsActivity.java
+@@ -392,6 +392,11 @@ public class GrantPermissionsActivity extends SettingsActivity
+                 mSystemRequestedPermissions.addAll(current.mSystemRequestedPermissions);
+                 sCurrentGrantRequests.put(mKey, this);
+                 onNewFollowerActivityLocked(null, current.mRequestedPermissions, false);
++                if (current.mViewHandler
++                        instanceof org.marathonos.deckard.permission.MarathonGrantView) {
++                    ((org.marathonos.deckard.permission.MarathonGrantView) current.mViewHandler)
++                            .handOver();
++                }
+                 current.finishAfterTransition();
+             } else if (current.mIsSystemTriggered) {
+                 // merge into the system triggered dialog, which has task overlay set
+diff --git a/PermissionController/src/org/marathonos/deckard/permission/MarathonGrantView.java b/PermissionController/src/org/marathonos/deckard/permission/MarathonGrantView.java
+index 5625863..b7aecd5 100644
+--- a/PermissionController/src/org/marathonos/deckard/permission/MarathonGrantView.java
++++ b/PermissionController/src/org/marathonos/deckard/permission/MarathonGrantView.java
+@@ -25,8 +25,10 @@ import com.android.permissioncontroller.permission.utils.PermissionMapping;
+ 
+ import java.util.ArrayList;
+ import java.util.Arrays;
++import java.util.HashMap;
+ import java.util.HashSet;
+ import java.util.List;
++import java.util.Map;
+ import java.util.Set;
+ 
+ /**
+@@ -71,6 +73,11 @@ public final class MarathonGrantView implements GrantPermissionsViewHandler {
+     private static final String FINE = "android.permission.ACCESS_FINE_LOCATION";
+     private static final String COARSE = "android.permission.ACCESS_COARSE_LOCATION";
+ 
++    // Marathon's prompts by id: an answer goes to the view that holds it now.
++    private static final Map<String, MarathonGrantView> OWNERS = new HashMap<>();
++    // A prompt from a dialog that merged into another, until that one asks.
++    private static MarathonGrantView sHandedOver;
++
+     private final Activity mActivity;
+     private final String mPackage;
+     private final ResultListener mListener;
+@@ -105,7 +112,11 @@ public final class MarathonGrantView implements GrantPermissionsViewHandler {
+             @Override public void onActivityStopped(Activity a) {}
+             @Override public void onActivitySaveInstanceState(Activity a, Bundle b) {}
+             @Override public void onActivityDestroyed(Activity a) {
++                if (sHandedOver == MarathonGrantView.this)
++                    return;
+                 cancelPending();
++                if (sHandedOver != null && sHandedOver.mPackage.equals(mPackage))
++                    adopt(null);
+             }
+         });
+     }
+@@ -202,7 +213,7 @@ public final class MarathonGrantView implements GrantPermissionsViewHandler {
+         }
+ 
+         String signature = group + Arrays.toString(mButtons) + Arrays.toString(mLocation);
+-        if (mPendingId != null && signature.equals(mPendingSignature))
++        if (adopt(signature) || mPendingId != null && signature.equals(mPendingSignature))
+             return;
+         cancelPending();
+         String id = ask(group);
+@@ -229,12 +240,17 @@ public final class MarathonGrantView implements GrantPermissionsViewHandler {
+         extras.putParcelable("receiver", forIpc(new ResultReceiver(mMain) {
+             @Override
+             protected void onReceiveResult(int code, Bundle data) {
+-                answered(data);
++                MarathonGrantView owner = data == null ? null : OWNERS.remove(data.getString("id"));
++                if (owner != null)
++                    owner.answered(data);
+             }
+         }));
+         try {
+             Bundle reply = mActivity.getContentResolver().call(PROMPTS, "ask", null, extras);
+-            return reply != null ? reply.getString("id") : null;
++            String id = reply != null ? reply.getString("id") : null;
++            if (id != null)
++                OWNERS.put(id, this);
++            return id;
+         } catch (RuntimeException e) {
+             Log.w(TAG, "Marathon can't ask: " + e);
+             return null;
+@@ -330,13 +346,54 @@ public final class MarathonGrantView implements GrantPermissionsViewHandler {
+             mStock.updateUi(mGroup, mCount, mIndex, mIcon, mMessage, mDetail, mRationale, mButtons, mLocation);
+     }
+ 
++    /**
++     * GrantPermissionsActivity folds this dialog into another for the same
++     * app: its prompt stays up for that one to adopt instead of being asked
++     * again.
++     */
++    public void handOver() {
++        if (mPendingId != null)
++            sHandedOver = this;
++    }
++
++    // Takes the handed-over prompt when it asks the same question; otherwise
++    // withdraws it. Null withdraws it.
++    private boolean adopt(String signature) {
++        MarathonGrantView held = sHandedOver;
++        if (held == null)
++            return false;
++        sHandedOver = null;
++        String id = held.mPendingId;
++        String heldSignature = held.mPendingSignature;
++        held.mPendingId = null;
++        held.mPendingSignature = null;
++        if (id == null)
++            return false;
++        if (signature != null && mPendingId == null && held.mPackage.equals(mPackage)
++                && signature.equals(heldSignature)) {
++            mPendingId = id;
++            mPendingSignature = signature;
++            OWNERS.put(id, this);
++            return true;
++        }
++        OWNERS.remove(id);
++        cancel(id);
++        return false;
++    }
++
+     private void cancelPending() {
+         if (mPendingId == null)
+             return;
+-        Bundle extras = new Bundle();
+-        extras.putString("id", mPendingId);
++        OWNERS.remove(mPendingId);
++        String id = mPendingId;
+         mPendingId = null;
+         mPendingSignature = null;
++        cancel(id);
++    }
++
++    private void cancel(String id) {
++        Bundle extras = new Bundle();
++        extras.putString("id", id);
+         try {
+             mActivity.getContentResolver().call(PROMPTS, "cancel", null, extras);
+         } catch (RuntimeException e) {
+-- 
+2.55.0
+

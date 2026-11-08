@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: patrickjquinn <patrick.jm.quinn@gmail.com>
+Date: Mon, 2 Nov 2026 16:47:51 +0000
+Subject: [PATCH] PermissionController: Let an app's own request lead over the
+ system prompt
+
+When an app targeting API 32 or lower starts, Android opens the
+notification prompt for it (REQUEST_PERMISSIONS_FOR_OTHER) as a task
+overlay. If the app then asks for permissions itself, the second
+GrantPermissionsActivity used to merge into the first as a delegated
+follower, and wait paused beneath the overlay until the first finished.
+The app's launch transition waits for that second activity to resume, so
+on Deckard the launch stalled until the 5 s readiness timeout.
+
+Marathon draws the prompts, so the overlay needn't stay on top. The app's
+activity now leads: it takes the system dialog's permissions, including
+the system-requested ones, and the system dialog, which needs no result,
+finishes. One activity resumes and asks for everything in one flow.
+Kept upstream's path when the system dialog already has followers.
+
+Change-Id: If633d56554c43779505f12c62ed35c67565193d7
+---
+ .../permission/ui/GrantPermissionsActivity.java           | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/PermissionController/src/com/android/permissioncontroller/permission/ui/GrantPermissionsActivity.java b/PermissionController/src/com/android/permissioncontroller/permission/ui/GrantPermissionsActivity.java
+index 913f31d..75da0e2 100644
+--- a/PermissionController/src/com/android/permissioncontroller/permission/ui/GrantPermissionsActivity.java
++++ b/PermissionController/src/com/android/permissioncontroller/permission/ui/GrantPermissionsActivity.java
+@@ -385,6 +385,14 @@ public class GrantPermissionsActivity extends SettingsActivity
+                 current.onNewFollowerActivityLocked(null, mRequestedPermissions, false);
+                 finishAfterTransition();
+                 return;
++            } else if (current.mIsSystemTriggered && current.mFollowerActivities.isEmpty()) {
++                // Deckard: Marathon draws the prompt, so the system's overlay dialog needn't
++                // stay above this one, which would wait paused beneath it. This leads; the
++                // system dialog needs no result.
++                mSystemRequestedPermissions.addAll(current.mSystemRequestedPermissions);
++                sCurrentGrantRequests.put(mKey, this);
++                onNewFollowerActivityLocked(null, current.mRequestedPermissions, false);
++                current.finishAfterTransition();
+             } else if (current.mIsSystemTriggered) {
+                 // merge into the system triggered dialog, which has task overlay set
+                 mDelegated = true;
+-- 
+2.55.0
+
