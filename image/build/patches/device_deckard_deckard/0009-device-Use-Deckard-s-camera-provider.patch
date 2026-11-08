@@ -1,0 +1,153 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: patrickjquinn <patrick.jm.quinn@gmail.com>
+Date: Mon, 2 Nov 2026 18:04:21 +0000
+Subject: [PATCH] device: Use Deckard's camera provider
+
+The host's cameras come through android.hardware.camera.provider-V1-deckard-service
+(hardware/deckard/camera) instead of the HIDL external provider, which
+opened /dev/video* inside Android. Declare a back and a front camera
+rather than full, raw and flash-autofocus features no camera has.
+---
+ configs/external_camera_config.xml | 77 ------------------------------
+ device.mk                          | 14 ++----
+ manifest.xml                       |  9 ----
+ 3 files changed, 3 insertions(+), 97 deletions(-)
+ delete mode 100644 configs/external_camera_config.xml
+
+diff --git a/configs/external_camera_config.xml b/configs/external_camera_config.xml
+deleted file mode 100644
+index 7b4a45d..0000000
+--- a/configs/external_camera_config.xml
++++ /dev/null
+@@ -1,77 +0,0 @@
+-<!--
+- Source:
+- https://github.com/BlissOS/device_generic_common/blob/7096d60e36653744f9f55fd2f02ff115f0b49774/external_camera_config.xml
+--->
+-
+-<ExternalCamera>
+-    <Provider>
+-        <ignore> <!-- Internal video devices to be ignored by external camera HAL -->
+-            <!-- <id>0</id> -->
+-            <!-- <id>1</id> -->
+-        </ignore>
+-    </Provider>
+-    <!-- See ExternalCameraUtils.cpp for default values of Device configurations below -->
+-    <Device>
+-        <!-- Max JPEG buffer size in bytes-->
+-        <MaxJpegBufferSize bytes="3145728"/> <!-- 3MB (~= 1080p YUV420) -->
+-        <!-- Size of v4l2 buffer queue when streaming >= 30fps -->
+-        <!-- Larger value: more request can be cached pipeline (less janky)  -->
+-        <!-- Smaller value: use less memory -->
+-        <NumVideoBuffers count="4"/>
+-        <!-- Size of v4l2 buffer queue when streaming < 30fps -->
+-        <NumStillBuffers count="2"/>
+-
+-        <!-- List of maximum fps for various output sizes -->
+-        <!-- Any image size smaller than the size listed in Limit row will report
+-            fps (as minimum frame duration) up to the fpsBound value. -->
+-        <FpsList>
+-            <!-- width/height must be increasing, fpsBound must be decreasing-->
+-            <Limit  width="176" height="144" fpsBound="60.0" />
+-            <Limit  width="176" height="144" fpsBound="30.0" />
+-            <Limit  width="176" height="144" fpsBound="20.0" />
+-            <Limit  width="176" height="144" fpsBound="15.0" />
+-            <Limit  width="320" height="240" fpsBound="60.0" />
+-            <Limit  width="320" height="240" fpsBound="30.0" />
+-            <Limit  width="320" height="240" fpsBound="20.0" />
+-            <Limit  width="320" height="240" fpsBound="15.0" />
+-            <Limit  width="352" height="288" fpsBound="30.0" />
+-            <Limit  width="352" height="288" fpsBound="20.0" />
+-            <Limit  width="352" height="288" fpsBound="15.0" />
+-            <Limit  width="640" height="480" fpsBound="60.0" />
+-            <Limit  width="640" height="480" fpsBound="30.0" />
+-            <Limit  width="640" height="480" fpsBound="20.0" />
+-            <Limit  width="640" height="480" fpsBound="15.0" />
+-            <Limit  width="640" height="480" fpsBound="10.0" />
+-            <Limit  width="800" height="600" fpsBound="30.0" />
+-            <Limit  width="800" height="600" fpsBound="20.0" />
+-            <Limit  width="800" height="600" fpsBound="15.0" />
+-            <Limit  width="1024" height="768" fpsBound="30.0" />
+-            <Limit  width="1024" height="768" fpsBound="20.0" />
+-            <Limit  width="1024" height="768" fpsBound="15.0" />
+-            <Limit  width="1024" height="768" fpsBound="10.0" />
+-            <Limit  width="1280" height="720" fpsBound="60.0" />
+-            <Limit  width="1280" height="720" fpsBound="30.0" />
+-            <Limit  width="1280" height="720" fpsBound="20.0" />
+-            <Limit  width="1280" height="720" fpsBound="15.0" />
+-            <Limit  width="1280" height="720" fpsBound="10.0" />
+-            <Limit  width="1280" height="800" fpsBound="30.0" />
+-            <Limit  width="1280" height="800" fpsBound="20.0" />
+-            <Limit  width="1280" height="800" fpsBound="15.0" />
+-            <Limit  width="1280" height="960" fpsBound="30.0" />
+-            <Limit  width="1280" height="960" fpsBound="20.0" />
+-            <Limit  width="1280" height="960" fpsBound="15.0" />
+-            <Limit  width="1280" height="1024" fpsBound="30.0" />
+-            <Limit  width="1280" height="1024" fpsBound="20.0" />
+-            <Limit  width="1280" height="1024" fpsBound="15.0" />
+-            <Limit  width="1600" height="1200" fpsBound="30.0" />
+-            <Limit  width="1600" height="1200" fpsBound="15.0" />
+-            <Limit  width="1920" height="1080" fpsBound="30.0" />
+-            <Limit  width="1920" height="1080" fpsBound="15.0" />
+-            <Limit  width="2592" height="1944" fpsBound="30.0" />
+-            <Limit  width="2592" height="1944" fpsBound="15.0" />
+-            <Limit  width="2592" height="1944" fpsBound="10.0" />
+-            <Limit  width="2592" height="1944" fpsBound="5.0" />
+-            <!-- image size larger than the last entry will not be supported-->
+-        </FpsList>
+-    </Device>
+-</ExternalCamera>
+diff --git a/device.mk b/device.mk
+index bc65f94..879ff53 100644
+--- a/device.mk
++++ b/device.mk
+@@ -73,15 +73,9 @@ PRODUCT_COPY_FILES += \
+     frameworks/av/services/audiopolicy/config/r_submix_audio_policy_configuration.xml:$(TARGET_COPY_OUT_VENDOR)/etc/r_submix_audio_policy_configuration.xml \
+     frameworks/av/services/audiopolicy/config/usb_audio_policy_configuration.xml:$(TARGET_COPY_OUT_VENDOR)/etc/usb_audio_policy_configuration.xml
+ 
+-# Camera
+-USE_CAMERA_V4L2_HAL := true
+-
++# Camera: the host's cameras through deckard-camera (hardware/deckard/camera)
+ PRODUCT_PACKAGES += \
+-    android.hardware.camera.provider@2.7-external-service \
+-    camera.v4l2
+-
+-PRODUCT_COPY_FILES += \
+-    $(LOCAL_PATH)/configs/external_camera_config.xml:$(TARGET_COPY_OUT_VENDOR)/etc/external_camera_config.xml
++    android.hardware.camera.provider-V1-deckard-service
+ 
+ # The host schedules the disk with BFQ, which has io.bfq.weight, not io.weight
+ PRODUCT_COPY_FILES += \
+@@ -283,10 +277,8 @@ PRODUCT_COPY_FILES += \
+     $(LOCAL_PATH)/configs/empty_permission.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions.disabled/empty_permission.xml \
+     frameworks/native/data/etc/handheld_core_hardware.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/handheld_core_hardware.xml \
+     frameworks/native/data/etc/android.hardware.audio.low_latency.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.audio.low_latency.xml \
+-    frameworks/native/data/etc/android.hardware.camera.flash-autofocus.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.camera.flash-autofocus.xml \
++    frameworks/native/data/etc/android.hardware.camera.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.camera.xml \
+     frameworks/native/data/etc/android.hardware.camera.front.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.camera.front.xml \
+-    frameworks/native/data/etc/android.hardware.camera.full.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.camera.full.xml \
+-    frameworks/native/data/etc/android.hardware.camera.raw.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.camera.raw.xml \
+     frameworks/native/data/etc/android.hardware.location.gps.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.location.gps.xml \
+     frameworks/native/data/etc/android.hardware.ethernet.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.ethernet.xml \
+     frameworks/native/data/etc/android.hardware.location.gps.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.location.gps.xml \
+diff --git a/manifest.xml b/manifest.xml
+index 5901789..cd95376 100644
+--- a/manifest.xml
++++ b/manifest.xml
+@@ -44,15 +44,6 @@ IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+             <instance>default</instance>
+         </interface>
+     </hal>
+-    <hal format="hidl">
+-        <name>android.hardware.camera.provider</name>
+-        <transport>hwbinder</transport>
+-        <version>2.7</version>
+-        <interface>
+-            <name>ICameraProvider</name>
+-            <instance>external/0</instance>
+-        </interface>
+-    </hal>
+     <hal format="hidl">
+         <name>android.hardware.configstore</name>
+         <transport>hwbinder</transport>
